@@ -41,10 +41,11 @@ def build_agent_rtc_rtm_token(channel_name: str, uid: int, rtm_uid: str) -> str:
     enable_rtm set, the agent reuses this same token to log in to RTM rather than
     accepting a second one, and RTM login fails if the token carries only RTC.
 
-    Note uid=0 means "any uid" to Agora, not "uid zero" — ServiceRtc encodes it as
-    an empty string, making the RTC half a channel-wide wildcard. That is upstream
-    behaviour and fine here because this token stays server-side, but it is why
-    this one must never be returned to a client.
+    The RTC half must be a channel-wide wildcard, and uid=0 is what produces one:
+    ServiceRtc encodes 0 as an empty string. This is required, not incidental —
+    agent_rtc_uid "0" tells Agora to assign the agent a random uid at join time, so
+    there is no specific uid to bind to. It does mean this token is valid for any
+    uid in the channel, which is why it must never be returned to a client.
     """
     token = AccessToken(settings.agora_app_id, settings.agora_app_certificate, expire=TOKEN_EXPIRY_SECONDS)
 
