@@ -2,7 +2,11 @@ from app.agents.style import SPOKEN_STYLE_RULES, TOPIC_BREADTH_RULE, format_prio
 from app.models.interview_profile import InterviewProfile
 
 
-def build_behavioral_persona_prompt(profile: InterviewProfile, prior_notes: list[str] | None = None) -> str:
+def build_behavioral_persona_prompt(
+    profile: InterviewProfile,
+    prior_notes: list[str] | None = None,
+    strong_topics: list[str] | None = None,
+) -> str:
     responsibilities = "; ".join(profile.responsibilities)
 
     return (
@@ -14,5 +18,5 @@ def build_behavioral_persona_prompt(profile: InterviewProfile, prior_notes: list
         "natural follow-up about what they just said. "
         f"{TOPIC_BREADTH_RULE} "
         f"{SPOKEN_STYLE_RULES} "
-        f"{format_prior_notes(prior_notes or [])}"
+        f"{format_prior_notes(prior_notes or [], strong_topics or [])}"
     )

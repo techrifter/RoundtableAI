@@ -33,11 +33,24 @@ TOPIC_BREADTH_RULE = (
 )
 
 
-def format_prior_notes(prior_notes: list[str]) -> str:
-    if not prior_notes:
-        return ""
-    joined = " | ".join(prior_notes)
-    return (
-        f"Earlier in this interview, the candidate said: {joined}. If one of these connects "
-        "naturally to your topic, refer back to it in your first question to show you were listening."
-    )
+def format_prior_notes(prior_notes: list[str], strong_topics: list[str] | None = None) -> str:
+    """What the previous interviewers learned, handed to the next persona.
+
+    Two kinds of memory: verbatim answers (so a callback can quote them) and the
+    topics the orchestrator's own scoring already marked as solid (so the persona
+    doesn't have to infer them from raw text).
+    """
+    parts = []
+    if prior_notes:
+        parts.append(
+            f"Earlier in this interview, the candidate said: {' | '.join(prior_notes)}. If one of these "
+            "connects naturally to your topic, refer back to it in your first question to show you were "
+            "listening."
+        )
+    if strong_topics:
+        unique = list(dict.fromkeys(strong_topics))[:5]
+        parts.append(
+            f"They have already answered well on: {', '.join(unique)}. Don't re-test these from scratch; "
+            "either build on one of them or spend your time somewhere new."
+        )
+    return " ".join(parts)
