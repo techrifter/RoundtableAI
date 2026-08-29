@@ -227,7 +227,7 @@ def collect_interview_evidence(profile: InterviewProfile, messages: list[dict]) 
 PRIOR_NOTES_LIMIT = 3  # cap, not "all of it" — see docstring
 
 
-def extract_prior_notes(messages: list[dict], stage_start_turn: int) -> list[str]:
+def extract_prior_notes(candidate_answers: list[str], stage_start_turn: int) -> list[str]:
     """A few candidate utterances from before this stage, so the next persona can
     reference something said earlier.
 
@@ -239,8 +239,7 @@ def extract_prior_notes(messages: list[dict], stage_start_turn: int) -> list[str
     to ("we ran Kafka in production") is usually made early — by the Behavioral
     round a tail slice contains nothing but System Design.
     """
-    user_messages = [m.get("content", "") for m in messages if m.get("role") == "user"]
-    earlier = [text for text in user_messages[:stage_start_turn] if text and text.strip()]
+    earlier = [text for text in candidate_answers[:stage_start_turn] if text and text.strip()]
     if len(earlier) <= PRIOR_NOTES_LIMIT:
         return earlier
 
@@ -250,12 +249,11 @@ def extract_prior_notes(messages: list[dict], stage_start_turn: int) -> list[str
 
 def build_stage_system_prompt(
     profile: InterviewProfile,
-    messages: list[dict],
+    candidate_answers: list[str],
     answer_times: list[float] | None = None,
 ) -> tuple[InterviewStage, str]:
-    candidate_answers = _candidate_answers(messages)
     state = _advance_stage_machine(profile, candidate_answers, answer_times)
-    prior_notes = extract_prior_notes(messages, state.stage_start_turn)
+    prior_notes = extract_prior_notes(candidate_answers, state.stage_start_turn)
 
     # strong_topics is already accumulated across every earlier stage by the stage
     # machine; handing it to the persona turns "spot the connection in this raw text"

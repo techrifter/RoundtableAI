@@ -29,26 +29,34 @@ _intro_given_by_channel: set[str] = set()
 # the candidate hangs up before the interview reaches its scripted close.
 _last_messages_by_channel: dict[str, list[dict]] = {}
 
-# One wall-clock stamp per candidate answer, so the orchestrator can budget a round
-# in minutes rather than turns. Appended as answers arrive rather than stored with
-# the message. Lost on restart, which the stage machine tolerates by falling back to its turn bounds.
+# The candidate's answers, accumulated per channel, plus one wall-clock stamp each.
+# Accumulating here keeps the orchestrator's view of the interview complete.
+_answers_by_channel: dict[str, list[str]] = {}
 _answer_times_by_channel: dict[str, list[float]] = {}
 
 
-def _record_answer_times(channel: str, answer_count: int) -> list[float]:
+def record_answer(channel: str, text: str) -> tuple[list[str], list[float]]:
+    """Records one candidate answer, or extends the previous one."""
+    answers = _answers_by_channel.setdefault(channel, [])
     times = _answer_times_by_channel.setdefault(channel, [])
-    now = time.time()
-    while len(times) < answer_count:
-        times.append(now)
-    return times
+
+    text = (text or "").strip()
+    if text:
+        if answers and (text.startswith(answers[-1]) or answers[-1].startswith(text)):
+            answers[-1] = text
+        else:
+            answers.append(text)
+            times.append(time.time())
+    return answers, times
+
+
+def get_last_messages(channel: str) -> list[dict]:
+    return _last_messages_by_channel.get(channel, [])
 
 
 def get_current_stage(channel: str) -> str | None:
     return _current_stage_by_channel.get(channel)
 
-
-def get_last_messages(channel: str) -> list[dict]:
-    return _last_messages_by_channel.get(channel, [])
 
 FALLBACK_SYSTEM_PROMPT = (
     "You are a technical interviewer. This only applies if the interview profile "
@@ -101,12 +109,12 @@ async def chat_completions(request: Request):
         if profile is None:
             stage, system_prompt = "unparsed", FALLBACK_SYSTEM_PROMPT
         else:
-            answer_count = sum(
-                1 for m in messages if m.get("role") == "user" and (m.get("content") or "").strip()
+            latest = next(
+                (m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), ""
             )
-            answer_times = _record_answer_times(channel, answer_count) if channel else None
+            answers, answer_times = record_answer(channel, latest) if channel else ([], [])
             try:
-                stage, system_prompt = build_stage_system_prompt(profile, messages, answer_times)
+                stage, system_prompt = build_stage_system_prompt(profile, answers, answer_times)
             except Exception:
                 stage, system_prompt = "unparsed", FALLBACK_SYSTEM_PROMPT
 
