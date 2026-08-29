@@ -21,15 +21,48 @@ class InterviewStage(str, Enum):
 
 STAGE_ORDER = [InterviewStage.TECHNICAL, InterviewStage.SYSTEM_DESIGN, InterviewStage.BEHAVIORAL]
 
-# Turns per stage adapt to the candidate — bail early on weak answers, linger on
-# strong ones — bounded so total interview length stays demo-safe.
-STAGE_FLOOR_TURNS = 2
-# Keep low: a higher ceiling lets one stage drill a single narrow detail for its
-# whole budget, since topic-coverage matching only catches literal JD keywords.
-# Works with TOPIC_BREADTH_RULE (agents/style.py), which caps same-detail follow-ups.
-STAGE_CEILING_TURNS = 4
-COVERAGE_TARGET_TOPICS = 3  # distinct JD topics touched before a stage is "enough"
-LOW_ENGAGEMENT_STREAK_TO_ADVANCE = 2  # consecutive weak answers before bailing early
+
+@dataclass(frozen=True)
+class StagePlan:
+    """How long a round should run, and how hard to push on one topic.
+
+    Time is the primary budget because this is an interview: the
+    round should last as long as the role warrants, not end early because the
+    candidate happened to be efficient. Turn bounds are guardrails around it, since
+    elapsed time alone would let a silent candidate skip a round in seconds or a
+    very talkative one run indefinitely.
+    """
+
+    min_seconds: int
+    max_seconds: int
+    min_turns: int
+    max_turns: int
+    topic_depth: int  # follow-ups allowed on a topic the candidate is strong in
+
+
+# Scales every time budget below without touching the topic logic, for shortening a
+# run locally. Turn bounds are deliberately unscaled, so the panel still works
+# through real topics at any setting. Committed value is always 1.0.
+TIME_SCALE = 1.0
+
+# Targets: technical 15-20 min, system design 10-15, behavioral 5-7.
+# Turn bounds assume roughly a minute per exchange (question, answer, turnaround).
+STAGE_PLANS: dict[InterviewStage, StagePlan] = {
+    InterviewStage.TECHNICAL: StagePlan(
+        min_seconds=15 * 60, max_seconds=20 * 60, min_turns=8, max_turns=22, topic_depth=3
+    ),
+    InterviewStage.SYSTEM_DESIGN: StagePlan(
+        min_seconds=10 * 60, max_seconds=15 * 60, min_turns=6, max_turns=16, topic_depth=3
+    ),
+    InterviewStage.BEHAVIORAL: StagePlan(
+        min_seconds=5 * 60, max_seconds=7 * 60, min_turns=4, max_turns=9, topic_depth=2
+    ),
+}
+
+# A weak answer ends the current topic immediately, but it takes this many in a row
+# to end the whole round early. Drilling something the candidate plainly doesn't
+# know wastes the round; one weak answer somewhere is just a gap, not a verdict.
+LOW_ENGAGEMENT_STREAK_TO_ADVANCE = 3
 
 # Distinct MiniMax voice per persona so the panel sounds like different people.
 STAGE_VOICE_CONFIG = {
@@ -60,58 +93,124 @@ class StageState:
     stage_start_turn: int  # index into the ordered list of candidate answers
     weak_topics: list[str]  # topics the candidate signaled low engagement on
     strong_topics: list[str]  # topics with a real, substantive answer
+    focus_topic: str | None  # topic to keep drilling, or None to pick a fresh one
+    covered_topics: list[str]  # topics already worked through in the current round
 
 
-def _advance_stage_machine(profile: InterviewProfile, candidate_answers: list[str]) -> StageState:
-    """Replays the candidate's answers in order against the adaptive floor/ceiling/
-    coverage/engagement rules, to deterministically compute the current stage. This
-    is re-derived from scratch on every request (no session store) since Agora
-    resends full history each call — cheap here since interviews are short.
+def _candidate_answers(messages: list[dict]) -> list[str]:
+    """Real answers only. The greeting turn arrives with empty ASR content, and an
+    empty string would otherwise burn a turn and score as low engagement on the
+    word-count check. Timestamps in api/llm.py are counted the same way, so the two
+    lists stay index-aligned.
     """
+    return [
+        text
+        for m in messages
+        if m.get("role") == "user" and (text := (m.get("content") or "").strip())
+    ]
+
+
+def _next_topic(topic_pool: list[str], done: set[str]) -> str | None:
+    return next((t for t in topic_pool if t not in done), None)
+
+
+def _advance_stage_machine(
+    profile: InterviewProfile,
+    candidate_answers: list[str],
+    answer_times: list[float] | None = None,
+) -> StageState:
+    """Replays the candidate's answers in order to compute the current stage and
+    which topic the panel should be on.
+
+    Two levers per round. Depth: a strong answer on a topic earns follow-ups on that
+    same topic, up to the plan's topic_depth, then the round moves to the next topic
+    in the pool. A weak answer ends that topic immediately, since drilling something
+    the candidate doesn't know teaches nobody anything. Breadth: the round ends once
+    its time budget is spent, or the topic pool is exhausted past the minimum.
+
+    `answer_times` is one wall-clock timestamp per answer. When absent (backend
+    restarted mid-interview, so the timestamps are gone) the turn bounds still hold
+    and the round runs to max_turns instead of a clock.
+    """
+    times = answer_times or []
+
     stage_idx = 0
     turns_in_stage = 0
     stage_start_turn = 0
-    topics_hit: set[str] = set()
     low_engagement_streak = 0
     weak_topics: list[str] = []
     strong_topics: list[str] = []
+
+    focus_topic: str | None = None
+    turns_on_focus = 0
+    covered: set[str] = set()
 
     for turn_index, answer in enumerate(candidate_answers):
         if stage_idx >= len(STAGE_ORDER):
             break  # already in FINAL_EVAL, nothing left to advance through
 
         stage = STAGE_ORDER[stage_idx]
+        plan = STAGE_PLANS[stage]
         topic_pool = _topic_pool_for(stage, profile)
         signal = analyze_answer(answer, topic_pool)
 
         turns_in_stage += 1
-        topics_hit |= signal.matched_topics
+
+        # Whatever they actually talked about counts as covered, even if the panel
+        # had aimed somewhere else — candidates lead the conversation sometimes.
+        covered |= signal.matched_topics
+        if focus_topic is None:
+            focus_topic = next(iter(signal.matched_topics), None) or _next_topic(topic_pool, covered)
+            turns_on_focus = 0
+        if focus_topic is not None:
+            covered.add(focus_topic)
+
+        turns_on_focus += 1
+
         if signal.is_low_engagement:
             low_engagement_streak += 1
-            weak_topics.extend(signal.matched_topics or [f"{stage.value} (turn {turns_in_stage})"])
+            weak_topics.extend(signal.matched_topics or [focus_topic or f"{stage.value} (turn {turns_in_stage})"])
+            focus_topic = None  # they don't know this one; stop drilling it
         else:
             low_engagement_streak = 0
-            strong_topics.extend(signal.matched_topics)
+            strong_topics.extend(signal.matched_topics or ([focus_topic] if focus_topic else []))
+            if turns_on_focus >= plan.topic_depth:
+                focus_topic = None  # drilled deep enough, take a fresh topic
 
-        should_advance = False
-        if turns_in_stage >= STAGE_FLOOR_TURNS:
-            if turns_in_stage >= STAGE_CEILING_TURNS:
-                should_advance = True
-            elif low_engagement_streak >= LOW_ENGAGEMENT_STREAK_TO_ADVANCE:
-                should_advance = True  # candidate isn't engaging here, stop drilling
-            elif len(topics_hit) >= min(COVERAGE_TARGET_TOPICS, len(topic_pool)):
-                should_advance = True  # good coverage already, no need to linger
+        if focus_topic is None:
+            focus_topic = _next_topic(topic_pool, covered)
+            turns_on_focus = 0
+
+        elapsed = (times[turn_index] - times[stage_start_turn]) if turn_index < len(times) else None
+
+        out_of_time = elapsed is not None and elapsed >= plan.max_seconds * TIME_SCALE
+        out_of_turns = turns_in_stage >= plan.max_turns
+        past_minimum = turns_in_stage >= plan.min_turns and (
+            elapsed is None or elapsed >= plan.min_seconds * TIME_SCALE
+        )
+        nothing_left = focus_topic is None and not _next_topic(topic_pool, covered)
+
+        # Sustained silence ends the round regardless of its time budget.
+        disengaged = low_engagement_streak >= LOW_ENGAGEMENT_STREAK_TO_ADVANCE
+
+        should_advance = out_of_time or out_of_turns or disengaged or (past_minimum and nothing_left)
 
         if should_advance:
             stage_idx += 1
             turns_in_stage = 0
             stage_start_turn = turn_index + 1
-            topics_hit = set()
             low_engagement_streak = 0
+            focus_topic = None
+            turns_on_focus = 0
+            covered = set()
 
     if stage_idx >= len(STAGE_ORDER):
-        return StageState(InterviewStage.FINAL_EVAL, stage_start_turn, weak_topics, strong_topics)
-    return StageState(STAGE_ORDER[stage_idx], stage_start_turn, weak_topics, strong_topics)
+        return StageState(InterviewStage.FINAL_EVAL, stage_start_turn, weak_topics, strong_topics, None, [])
+
+    stage = STAGE_ORDER[stage_idx]
+    if focus_topic is None:
+        focus_topic = _next_topic(_topic_pool_for(stage, profile), covered)
+    return StageState(stage, stage_start_turn, weak_topics, strong_topics, focus_topic, sorted(covered))
 
 
 def collect_interview_evidence(profile: InterviewProfile, messages: list[dict]) -> tuple[list[str], list[str]]:
@@ -121,8 +220,7 @@ def collect_interview_evidence(profile: InterviewProfile, messages: list[dict]) 
     than a second analysis pass, so the report stays consistent with what actually
     drove stage routing instead of judging the transcript from scratch.
     """
-    candidate_answers = [m.get("content", "") for m in messages if m.get("role") == "user"]
-    state = _advance_stage_machine(profile, candidate_answers)
+    state = _advance_stage_machine(profile, _candidate_answers(messages))
     return state.weak_topics, state.strong_topics
 
 
@@ -150,9 +248,13 @@ def extract_prior_notes(messages: list[dict], stage_start_turn: int) -> list[str
     return [earlier[round(i * step)] for i in range(PRIOR_NOTES_LIMIT)]
 
 
-def build_stage_system_prompt(profile: InterviewProfile, messages: list[dict]) -> tuple[InterviewStage, str]:
-    candidate_answers = [m.get("content", "") for m in messages if m.get("role") == "user"]
-    state = _advance_stage_machine(profile, candidate_answers)
+def build_stage_system_prompt(
+    profile: InterviewProfile,
+    messages: list[dict],
+    answer_times: list[float] | None = None,
+) -> tuple[InterviewStage, str]:
+    candidate_answers = _candidate_answers(messages)
+    state = _advance_stage_machine(profile, candidate_answers, answer_times)
     prior_notes = extract_prior_notes(messages, state.stage_start_turn)
 
     # strong_topics is already accumulated across every earlier stage by the stage
@@ -160,12 +262,14 @@ def build_stage_system_prompt(profile: InterviewProfile, messages: list[dict]) -
     # into an explicit list of what the candidate has actually demonstrated.
     strong = state.strong_topics
 
+    focus = state.focus_topic
+
     if state.stage == InterviewStage.TECHNICAL:
-        return state.stage, build_technical_persona_prompt(profile, prior_notes, strong)
+        return state.stage, build_technical_persona_prompt(profile, prior_notes, strong, focus)
     if state.stage == InterviewStage.SYSTEM_DESIGN:
-        return state.stage, build_system_design_persona_prompt(profile, prior_notes, strong)
+        return state.stage, build_system_design_persona_prompt(profile, prior_notes, strong, focus)
     if state.stage == InterviewStage.BEHAVIORAL:
-        return state.stage, build_behavioral_persona_prompt(profile, prior_notes, strong)
+        return state.stage, build_behavioral_persona_prompt(profile, prior_notes, strong, focus)
     return state.stage, (
         "The interview is now over. Say goodbye to the candidate in one short, warm sentence. "
         f'Say something close to: "{CLOSING_MESSAGE}"'

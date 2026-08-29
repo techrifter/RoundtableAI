@@ -22,15 +22,22 @@ SPOKEN_STYLE_RULES = (
 )
 
 
-# "Ask a natural follow-up" on its own makes the model drill one narrow detail for a
-# whole stage — a strong answer always seems to deserve another follow-up. Cap it
-# explicitly. Paired with STAGE_CEILING_TURNS in orchestrator.py.
+# The orchestrator decides which topic is live and when to leave it, so the prompt
+# no longer has to guess. This only tells the persona how to behave while it's there.
 TOPIC_BREADTH_RULE = (
-    "Cover real breadth, not just depth: ask at most two questions in a row about the exact same "
-    "specific detail, library, or project. After that, deliberately move to a different skill or area "
-    "from what's listed above, even if the candidate's last answer was strong and you could keep digging. "
-    "There are other topics to get through, so don't let one good answer eat the whole round."
+    "Stay on the topic you are given until you are moved off it. Each follow-up should go one level "
+    "deeper than the last, into trade-offs, failure cases, or what they would do differently, rather "
+    "than restating the same question. Do not jump to an unrelated skill on your own."
 )
+
+
+def format_focus_topic(topic: str | None) -> str:
+    if not topic:
+        return ""
+    return (
+        f"Right now, focus your question on: {topic}. If the candidate has already shown they know "
+        "this well, push into something harder within it rather than asking a beginner question."
+    )
 
 
 def format_prior_notes(prior_notes: list[str], strong_topics: list[str] | None = None) -> str:

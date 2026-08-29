@@ -29,6 +29,19 @@ _intro_given_by_channel: set[str] = set()
 # the candidate hangs up before the interview reaches its scripted close.
 _last_messages_by_channel: dict[str, list[dict]] = {}
 
+# One wall-clock stamp per candidate answer, so the orchestrator can budget a round
+# in minutes rather than turns. Appended as answers arrive rather than stored with
+# the message. Lost on restart, which the stage machine tolerates by falling back to its turn bounds.
+_answer_times_by_channel: dict[str, list[float]] = {}
+
+
+def _record_answer_times(channel: str, answer_count: int) -> list[float]:
+    times = _answer_times_by_channel.setdefault(channel, [])
+    now = time.time()
+    while len(times) < answer_count:
+        times.append(now)
+    return times
+
 
 def get_current_stage(channel: str) -> str | None:
     return _current_stage_by_channel.get(channel)
@@ -88,8 +101,12 @@ async def chat_completions(request: Request):
         if profile is None:
             stage, system_prompt = "unparsed", FALLBACK_SYSTEM_PROMPT
         else:
+            answer_count = sum(
+                1 for m in messages if m.get("role") == "user" and (m.get("content") or "").strip()
+            )
+            answer_times = _record_answer_times(channel, answer_count) if channel else None
             try:
-                stage, system_prompt = build_stage_system_prompt(profile, messages)
+                stage, system_prompt = build_stage_system_prompt(profile, messages, answer_times)
             except Exception:
                 stage, system_prompt = "unparsed", FALLBACK_SYSTEM_PROMPT
 
