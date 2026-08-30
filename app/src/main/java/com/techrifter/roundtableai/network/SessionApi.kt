@@ -4,8 +4,11 @@ import android.content.Context
 import android.net.Uri
 import android.provider.OpenableColumns
 import com.techrifter.roundtableai.BuildConfig
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
@@ -20,6 +23,12 @@ import java.util.concurrent.TimeUnit
 
 // Backend base URL is configured in build.gradle and injected into BuildConfig at build time.
 private val BACKEND_BASE_URL = BuildConfig.BACKEND_BASE_URL
+
+private val BACKEND_IS_RENDER = BACKEND_BASE_URL.contains(".onrender.com")
+
+private const val WARM_UP_ATTEMPTS = 4
+private const val WARM_UP_RETRY_DELAY_MS = 2_000L
+private const val WARM_UP_WAIT_MS = 90_000L
 
 private const val BACKEND_UNREACHABLE =
     "Can't reach the interview service right now. Try again after some time."
@@ -97,12 +106,35 @@ class SessionApi {
         .readTimeout(20, TimeUnit.SECONDS)
         .build()
 
+    // Starts already complete off Render, so local development never waits on it.
+    private val warmedUp = CompletableDeferred<Unit>().apply { if (!BACKEND_IS_RENDER) complete(Unit) }
+
+    /** Wakes a sleeping instance. */
+    suspend fun warmUp() = withContext(Dispatchers.IO) {
+        if (warmedUp.isCompleted) return@withContext
+        val request = Request.Builder().url("$BACKEND_BASE_URL/health").get().build()
+        for (attempt in 1..WARM_UP_ATTEMPTS) {
+            val awake = try {
+                client.newCall(request).execute().use { it.isSuccessful }
+            } catch (t: IOException) {
+                false
+            }
+            if (awake) break
+            delay(WARM_UP_RETRY_DELAY_MS)
+        }
+        // Completed even if it never answered, so the upload is never blocked.
+        warmedUp.complete(Unit)
+    }
+
     /** Uploads the candidate's JD and/or resume — either one alone is enough, returns the
      * resulting profile_id to pass to startSession. Parsing happens once up
      * front so the app can show the candidate what the panel actually
      * understood before joining the call. */
     suspend fun uploadJd(context: Context, jdUri: Uri?, resumeUri: Uri?): UploadResult =
         withContext(Dispatchers.IO) {
+            // Wait for the warm-up to finish, but don't block forever if it never does.
+            withTimeoutOrNull(WARM_UP_WAIT_MS) { warmedUp.await() }
+
             val bodyBuilder = MultipartBody.Builder().setType(MultipartBody.FORM)
             if (jdUri != null) addFilePart(bodyBuilder, context, "jd_file", jdUri)
             if (resumeUri != null) addFilePart(bodyBuilder, context, "resume_file", resumeUri)

@@ -104,6 +104,10 @@ class InterviewViewModel(application: Application) : AndroidViewModel(applicatio
     // pattern for upserting streaming transcript rows as they arrive/finalize.
     private val transcriptByKey = LinkedHashMap<String, TranscriptEntry>()
 
+    init {
+        viewModelScope.launch { sessionApi.warmUp() }
+    }
+
     private val rtcEventHandler = object : IRtcEngineEventHandler() {
         override fun onJoinChannelSuccess(channel: String?, uid: Int, elapsed: Int) {
             _uiState.value = _uiState.value.copy(status = InterviewStatus.LIVE)
