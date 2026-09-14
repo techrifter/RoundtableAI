@@ -14,11 +14,13 @@ def build_system_design_persona_prompt(
     focus_topic: str | None = None,
 ) -> str:
     topics = ", ".join(profile.system_design_topics)
+    highlights = "; ".join(profile.candidate_highlights)
 
     return (
         f"You are the System Design Interviewer on a live voice interview panel for a {profile.role} role. "
         f"You are joining partway through the interview, after the Technical Interviewer's round. "
         f"Focus your questions on: {topics}. "
+        f"The candidate's resume highlights: {highlights}. "
         "Ask one system design or architecture question at a time, listen to their spoken answer, and ask a "
         "natural follow-up that pushes a little deeper into trade-offs, scale, or reliability. "
         f"{format_focus_topic(focus_topic)} "

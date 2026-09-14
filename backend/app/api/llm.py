@@ -34,20 +34,40 @@ _last_messages_by_channel: dict[str, list[dict]] = {}
 _answers_by_channel: dict[str, list[str]] = {}
 _answer_times_by_channel: dict[str, list[float]] = {}
 
+# The interviewer's question that came right before the last recorded answer.
+# A new question always means a new answer, even if the candidate says the same
+# thing again ("I don't know"). Only text for the same question gets merged.
+_last_question_by_channel: dict[str, str] = {}
 
-def record_answer(channel: str, text: str) -> tuple[list[str], list[float]]:
-    """Records one candidate answer, or extends the previous one."""
+
+def record_answer(channel: str, text: str, question: str = "") -> tuple[list[str], list[float]]:
+    """Records one candidate answer, or updates the previous one if the
+    transcript for the same question is still coming in."""
     answers = _answers_by_channel.setdefault(channel, [])
     times = _answer_times_by_channel.setdefault(channel, [])
 
     text = (text or "").strip()
     if text:
-        if answers and (text.startswith(answers[-1]) or answers[-1].startswith(text)):
+        same_question = _last_question_by_channel.get(channel) == question
+        text_overlaps = bool(answers) and (text.startswith(answers[-1]) or answers[-1].startswith(text))
+        if same_question and text_overlaps:
             answers[-1] = text
         else:
             answers.append(text)
             times.append(time.time())
+        _last_question_by_channel[channel] = question
     return answers, times
+
+
+def _question_before_latest_answer(messages: list[dict]) -> str:
+    """The interviewer's message just before the candidate's latest message."""
+    found_answer = False
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            found_answer = True
+        elif m.get("role") == "assistant" and found_answer:
+            return (m.get("content") or "").strip()
+    return ""
 
 
 def get_last_messages(channel: str) -> list[dict]:
@@ -112,7 +132,8 @@ async def chat_completions(request: Request):
             latest = next(
                 (m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), ""
             )
-            answers, answer_times = record_answer(channel, latest) if channel else ([], [])
+            question = _question_before_latest_answer(messages)
+            answers, answer_times = record_answer(channel, latest, question) if channel else ([], [])
             try:
                 stage, system_prompt = build_stage_system_prompt(profile, answers, answer_times)
             except Exception:
