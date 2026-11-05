@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Inset wrapper carefully calibrated to:
+     1. Keep the top interviewer avatar head safely inside Android 12+'s 160dp circular splash mask.
+     2. Keep all 4 squircle card edges and corners well outside the circular mask so no square box edges are visible. -->
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:drawable="@drawable/splash_logo"
+    android:insetTop="10dp"
+    android:insetBottom="6dp"
+    android:insetLeft="6dp"
+    android:insetRight="6dp" />

@@ -5,11 +5,16 @@ import time
 from fastapi import APIRouter, Request
 from sse_starlette.sse import EventSourceResponse
 
-from app.api.jd import get_profile_for_channel
+from app.api.jd import get_channel_session_meta, get_profile_for_channel
 from app.config import settings
 from app.agents.style import SPOKEN_TONE_RULES
 from app.evaluation.report import has_report_started, start_report_generation
-from app.orchestration.orchestrator import InterviewStage, build_stage_system_prompt, get_stage_voice_config
+from app.orchestration.orchestrator import (
+    InterviewStage,
+    build_stage_system_prompt,
+    get_stage_voice_config,
+    resolve_focused_stage,
+)
 from app.services.http_client import get_http_client
 
 router = APIRouter()
@@ -38,6 +43,15 @@ _answer_times_by_channel: dict[str, list[float]] = {}
 # A new question always means a new answer, even if the candidate says the same
 # thing again ("I don't know"). Only text for the same question gets merged.
 _last_question_by_channel: dict[str, str] = {}
+
+
+def clear_channel_state(channel: str) -> None:
+    _current_stage_by_channel.pop(channel, None)
+    _intro_given_by_channel.discard(channel)
+    _last_messages_by_channel.pop(channel, None)
+    _answers_by_channel.pop(channel, None)
+    _answer_times_by_channel.pop(channel, None)
+    _last_question_by_channel.pop(channel, None)
 
 
 def record_answer(channel: str, text: str, question: str = "") -> tuple[list[str], list[float]]:
@@ -119,8 +133,23 @@ async def chat_completions(request: Request):
     if channel:
         _last_messages_by_channel[channel] = messages
 
+    meta = get_channel_session_meta(channel) if channel else None
+    mode = meta.mode if meta else "full"
+    target_skill = meta.target_skill if meta else None
+
     if intro_only:
-        stage, system_prompt = InterviewStage.TECHNICAL, INTRO_SYSTEM_PROMPT
+        if mode == "focused" and target_skill:
+            profile = get_profile_for_channel(channel) if channel else None
+            stage = resolve_focused_stage(target_skill, profile) if profile else InterviewStage.TECHNICAL
+            system_prompt = (
+                f"You are the interviewer opening a focused practice drill on {target_skill} with the candidate. "
+                "Say two short sentences: hello and thanks for joining, and set expectations that this is a quick "
+                f"focused drill specifically on {target_skill} to practice core concepts with instant feedback. "
+                "Encourage them to think out loud. Do not ask a question yet, that starts on your next turn. "
+                f"{SPOKEN_TONE_RULES}"
+            )
+        else:
+            stage, system_prompt = InterviewStage.TECHNICAL, INTRO_SYSTEM_PROMPT
     else:
         # A live session always has a profile bound by POST /session/start; None
         # here means the backend restarted mid-interview. Keep the conversation
@@ -135,7 +164,9 @@ async def chat_completions(request: Request):
             question = _question_before_latest_answer(messages)
             answers, answer_times = record_answer(channel, latest, question) if channel else ([], [])
             try:
-                stage, system_prompt = build_stage_system_prompt(profile, answers, answer_times)
+                stage, system_prompt = build_stage_system_prompt(
+                    profile, answers, answer_times, mode=mode, target_skill=target_skill
+                )
             except Exception:
                 stage, system_prompt = "unparsed", FALLBACK_SYSTEM_PROMPT
 
@@ -153,7 +184,13 @@ async def chat_completions(request: Request):
         # Kicked off here (not awaited) so the goodbye line streams to TTS
         # immediately — evaluation runs in the background and is picked up by
         # the client polling GET /session/{channel}/report.
-        start_report_generation(channel, profile, messages)
+        start_report_generation(
+            channel,
+            profile,
+            messages,
+            mode=mode,
+            target_skill=target_skill,
+        )
 
     if messages and messages[0].get("role") == "system":
         messages = [{"role": "system", "content": system_prompt}, *messages[1:]]

@@ -1,4 +1,3 @@
-
 # Roundtable AI
 
 **Upload a job description. Get interviewed by an AI panel over live voice. Walk away with a scored, evidence-backed evaluation.**
@@ -11,8 +10,8 @@ Roundtable AI is an Android app that runs a real job interview. You hand it the 
 
 > **[▶ Watch a full interview in 4 minutes](https://youtu.be/vLGOhcjKvqk)**
 
-| Panel ready | Live interview | Report |
-| :---------: | :------------: | :----: |
+|            Panel ready            |            Live interview            |            Report            |
+| :-------------------------------: | :----------------------------------: | :---------------------------: |
 | ![](docs/screens/panelReady.webp) | ![](docs/screens/liveInterview.webp) | ![](docs/screens/report.webp) |
 
 ---
@@ -163,6 +162,38 @@ cp .env.example .env        # then fill it in; each line says where to get the v
 python -m uvicorn app.main:app --port 8000 --reload
 ```
 
+Enable Email/Password and Google sign-in in Firebase Authentication. Add the Android app's
+SHA-1/SHA-256 signing fingerprints in Firebase, then keep the generated
+`app/google-services.json` in place. It contains public client configuration, not a server
+credential; restrict its API key to this Android app and the APIs it needs.
+
+For local backend development, set `FIREBASE_SERVICE_ACCOUNT_PATH` in `backend/.env` to a
+service-account JSON file. Never commit that private key. On Google Cloud, leave the setting
+empty and grant the deployed service an appropriate identity; the Firebase Admin SDK will use
+Application Default Credentials for Firebase Auth verification and Firestore access.
+
+Account deletion requests are persisted in Firestore. While the API process is running, an
+in-process worker polls the queue every hour, retries failures with backoff, and
+resumes queued or expired-lease requests after restarts. Multiple API instances are safe:
+Firestore leases prevent the same request from being processed concurrently. For deployments
+where the API may sleep or stop for long periods, configure a scheduler to run
+`cd backend && python -m app.worker` every hour; this one-shot worker uses the same
+queue and retry logic. 
+The public privacy policy is
+https://sites.google.com/view/roundtableai-privacy-policy, and the external account-deletion
+request page is https://sites.google.com/view/roundtableai-deletion-policy. Use these HTTPS
+URLs in the Play Store listing and Data safety account-deletion fields. The backend also
+serves copies at `/privacy` and `/account-deletion`.
+
+By default, account deletion removes the user's Firebase Auth account and all owned profiles,
+sessions, reports, quota data, and waitlist entry. For a specific legal obligation or claim,
+trusted project administrators may create `legal_holds/{uid}` in Firestore with a non-empty
+`reason`, an `expires_at_epoch` (UTC Unix seconds), and explicit `profile_ids` and
+`session_ids` arrays. Only those listed profile/session documents are retained; Auth, quota,
+and waitlist data are still deleted. Administrators must remove retained documents and the
+hold record when the legal need ends; this project does not run an automatic legal-hold expiry
+job.
+
 Agora calls your backend mid-conversation, so it needs a public HTTPS URL:
 
 ```bash
@@ -180,6 +211,15 @@ backend.baseUrl=https://your-tunnel.ngrok-free.dev
 ```
 
 Then run the app. Grant microphone permission, pick a JD or resume, tap **Analyze documents**, confirm the extracted role, and **Begin session**.
+
+### Free interview allowance
+
+The free plan allows two interviews in a rolling 24-hour window. Uploading or analyzing
+documents does not use an interview; starting one does. A completed focused-practice retry
+is a new interview and counts toward the same allowance. If agent startup fails, that failed
+attempt can be retried within 15 minutes without consuming an additional slot. The backend
+enforces the allowance transactionally in Firestore; if Firestore is unavailable, starting
+an interview fails closed rather than bypassing the limit.
 
 ### API
 

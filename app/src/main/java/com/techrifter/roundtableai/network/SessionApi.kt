@@ -6,6 +6,7 @@ import android.provider.OpenableColumns
 import com.techrifter.roundtableai.BuildConfig
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -29,6 +30,8 @@ private val BACKEND_IS_RENDER = BACKEND_BASE_URL.contains(".onrender.com")
 private const val WARM_UP_ATTEMPTS = 4
 private const val WARM_UP_RETRY_DELAY_MS = 2_000L
 private const val WARM_UP_WAIT_MS = 90_000L
+private const val LIMITS_REQUEST_ATTEMPTS = 3
+private const val LIMITS_RETRY_DELAY_MS = 1_500L
 
 private const val BACKEND_UNREACHABLE =
     "Can't reach the interview service right now. Try again after some time."
@@ -75,7 +78,20 @@ data class InterviewReport(
     val strengths: List<EvidencePoint>,
     val improvements: List<EvidencePoint>,
     val summary: String,
-)
+    val mode: String = "full",
+    val targetSkill: String? = null,
+) {
+    constructor(
+        technical: Double,
+        systemDesign: Double,
+        behavioral: Double,
+        communication: Double,
+        overall: Double,
+        strengths: List<EvidencePoint>,
+        improvements: List<EvidencePoint>,
+        summary: String,
+    ) : this(technical, systemDesign, behavioral, communication, overall, strengths, improvements, summary, "full", null)
+}
 
 data class ReportResult(val status: String, val report: InterviewReport?)
 
@@ -86,6 +102,14 @@ data class InterviewProfilePreview(
 )
 
 data class UploadResult(val profileId: String, val profile: InterviewProfilePreview)
+
+data class UserLimits(
+    val dailyLimit: Int = 2,
+    val usedToday: Int = 0,
+    val remaining: Int = 2,
+    val canStart: Boolean = true,
+    val hasJoinedWaitlist: Boolean = false,
+)
 
 /** Resolves a content:// Uri's display name (e.g. "Resume.pdf") — the backend
  * dispatches on the extension and the picker UI labels the button with it. Falls
@@ -100,7 +124,12 @@ fun resolveDisplayName(context: Context, uri: Uri): String {
     return uri.lastPathSegment ?: "document"
 }
 
-class SessionApi {
+/**
+ * [tokenProvider] is a suspend function that returns the current Firebase ID token,
+ * or null if the user is not signed in. Called before every request so the token
+ * is always fresh (Firebase refreshes it automatically when < 5 min remain).
+ */
+class SessionApi(private val tokenProvider: suspend () -> String?) {
     private val client = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(20, TimeUnit.SECONDS)
@@ -108,6 +137,14 @@ class SessionApi {
 
     // Starts already complete off Render, so local development never waits on it.
     private val warmedUp = CompletableDeferred<Unit>().apply { if (!BACKEND_IS_RENDER) complete(Unit) }
+
+    /** Builds a Request.Builder pre-populated with the Authorization header. */
+    private suspend fun authedRequest(url: String): Request.Builder {
+        val token = tokenProvider()
+        return Request.Builder()
+            .url(url)
+            .apply { if (token != null) header("Authorization", "Bearer $token") }
+    }
 
     /** Wakes a sleeping instance. */
     suspend fun warmUp() = withContext(Dispatchers.IO) {
@@ -126,6 +163,90 @@ class SessionApi {
         warmedUp.complete(Unit)
     }
 
+    /** Fetches the candidate's current session limits and remaining interviews in the last 24 hours. */
+    suspend fun getUserLimits(): UserLimits? = withContext(Dispatchers.IO) {
+        // The dashboard may request limits before the startup warm-up completes.
+        withTimeoutOrNull(WARM_UP_WAIT_MS) { warmedUp.await() }
+        val request = authedRequest("$BACKEND_BASE_URL/session/limits").get().build()
+        repeat(LIMITS_REQUEST_ATTEMPTS) { attempt ->
+            try {
+                client.newCall(request).execute().use { response ->
+                    if (response.code in 500..599 && attempt < LIMITS_REQUEST_ATTEMPTS - 1) {
+                        android.util.Log.w(
+                            "SessionApi",
+                            "Limits request returned HTTP ${response.code}; retrying",
+                        )
+                    } else if (!response.isSuccessful) {
+                        android.util.Log.w("SessionApi", "Limits request failed: HTTP ${response.code}")
+                        return@withContext null
+                    } else {
+                        val json = JSONObject(response.body?.string().orEmpty())
+                        val requiredFields = listOf(
+                            "daily_limit",
+                            "used_today",
+                            "remaining",
+                            "can_start",
+                            "has_joined_waitlist",
+                        )
+                        if (requiredFields.any { !json.has(it) || json.isNull(it) }) {
+                            android.util.Log.e("SessionApi", "Limits response is missing required fields")
+                            return@withContext null
+                        }
+                        return@withContext UserLimits(
+                            dailyLimit = json.getInt("daily_limit"),
+                            usedToday = json.getInt("used_today"),
+                            remaining = json.getInt("remaining"),
+                            canStart = json.getBoolean("can_start"),
+                            hasJoinedWaitlist = json.getBoolean("has_joined_waitlist"),
+                        )
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: IOException) {
+                android.util.Log.w(
+                    "SessionApi",
+                    "Limits request attempt ${attempt + 1} failed due to network error",
+                    e,
+                )
+                if (attempt == LIMITS_REQUEST_ATTEMPTS - 1) return@withContext null
+            } catch (e: Exception) {
+                android.util.Log.e("SessionApi", "Could not read limits response", e)
+                return@withContext null
+            }
+            delay(LIMITS_RETRY_DELAY_MS * (attempt + 1))
+        }
+        null
+    }
+
+    /** Adds the candidate's verified account to the Pro early-access waitlist. */
+    suspend fun joinWaitlist(): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val request = authedRequest("$BACKEND_BASE_URL/user/waitlist")
+                .post("{}".toRequestBody("application/json".toMediaType()))
+                .build()
+            client.newCall(request).execute().use { response ->
+                android.util.Log.d("SessionApi", "joinWaitlist HTTP code: ${response.code}")
+                response.isSuccessful
+            }
+        } catch (t: Throwable) {
+            android.util.Log.e("SessionApi", "joinWaitlist error: ${t.message}", t)
+            false
+        }
+    }
+
+    /** Submits an authenticated account-deletion request to the backend queue. */
+    suspend fun deleteAccount() = withContext(Dispatchers.IO) {
+        val request = authedRequest("$BACKEND_BASE_URL/user/account")
+            .delete()
+            .build()
+        client.executeOrFail(request).use { response ->
+            if (!response.isSuccessful) {
+                error(response.candidateFacingError("Couldn't delete the account. Please try again."))
+            }
+        }
+    }
+
     /** Uploads the candidate's JD and/or resume — either one alone is enough, returns the
      * resulting profile_id to pass to startSession. Parsing happens once up
      * front so the app can show the candidate what the panel actually
@@ -138,8 +259,7 @@ class SessionApi {
             val bodyBuilder = MultipartBody.Builder().setType(MultipartBody.FORM)
             if (jdUri != null) addFilePart(bodyBuilder, context, "jd_file", jdUri)
             if (resumeUri != null) addFilePart(bodyBuilder, context, "resume_file", resumeUri)
-            val request = Request.Builder()
-                .url("$BACKEND_BASE_URL/jd/upload")
+            val request = authedRequest("$BACKEND_BASE_URL/jd/upload")
                 .post(bodyBuilder.build())
                 .build()
 
@@ -168,10 +288,22 @@ class SessionApi {
         builder.addFormDataPart(field, filename, bytes.toRequestBody(mediaType))
     }
 
-    suspend fun startSession(profileId: String): SessionInfo = withContext(Dispatchers.IO) {
-        val payload = JSONObject().put("profile_id", profileId).toString()
-        val request = Request.Builder()
-            .url("$BACKEND_BASE_URL/session/start")
+    suspend fun startSession(profileId: String): SessionInfo =
+        startSession(profileId, "full", null)
+
+    suspend fun startSession(
+        profileId: String,
+        mode: String = "full",
+        targetSkill: String? = null,
+    ): SessionInfo = withContext(Dispatchers.IO) {
+        val payload = JSONObject().apply {
+            put("profile_id", profileId)
+            put("mode", mode)
+            if (!targetSkill.isNullOrBlank()) {
+                put("target_skill", targetSkill)
+            }
+        }.toString()
+        val request = authedRequest("$BACKEND_BASE_URL/session/start")
             .post(payload.toRequestBody("application/json".toMediaType()))
             .build()
 
@@ -195,8 +327,7 @@ class SessionApi {
      * interviewing. Returns null if the backend hasn't recorded a turn yet
      * (e.g. right at call start) or the request fails. */
     suspend fun getCurrentStage(channelName: String): String? = withContext(Dispatchers.IO) {
-        val request = Request.Builder()
-            .url("$BACKEND_BASE_URL/session/$channelName/stage")
+        val request = authedRequest("$BACKEND_BASE_URL/session/$channelName/stage")
             .get()
             .build()
 
@@ -217,8 +348,7 @@ class SessionApi {
      * does the same job (or the interview reached FINAL_EVAL and already
      * triggered it server-side on its own). */
     suspend fun endSession(channelName: String): ReportResult? = withContext(Dispatchers.IO) {
-        val request = Request.Builder()
-            .url("$BACKEND_BASE_URL/session/$channelName/end")
+        val request = authedRequest("$BACKEND_BASE_URL/session/$channelName/end")
             .post("".toRequestBody("application/json".toMediaType()))
             .build()
         try {
@@ -234,8 +364,7 @@ class SessionApi {
      * background task once the panel reaches its final stage, so this is usually
      * already "pending" or "ready" by the time the candidate disconnects. */
     suspend fun getReport(channelName: String): ReportResult? = withContext(Dispatchers.IO) {
-        val request = Request.Builder()
-            .url("$BACKEND_BASE_URL/session/$channelName/report")
+        val request = authedRequest("$BACKEND_BASE_URL/session/$channelName/report")
             .get()
             .build()
 
@@ -272,6 +401,8 @@ class SessionApi {
                     }
                 },
                 summary = r.getString("summary"),
+                mode = r.optString("mode", "full"),
+                targetSkill = if (r.isNull("target_skill") || r.optString("target_skill").isBlank()) null else r.optString("target_skill"),
             )
         }
         return ReportResult(status = status, report = report)

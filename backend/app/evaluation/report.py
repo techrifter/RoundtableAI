@@ -6,6 +6,7 @@ from typing import NamedTuple
 from pydantic import BaseModel, ValidationError
 
 from app.config import settings
+from app.firestore_db import get_session_report_from_firestore, update_session_report
 from app.services.agora_agent import fetch_agent_history, get_agent_id
 from app.models.interview_profile import InterviewProfile
 from app.orchestration.orchestrator import collect_interview_evidence
@@ -22,6 +23,8 @@ class EvidencePoint(BaseModel):
 
 
 class InterviewReport(BaseModel):
+    mode: str = "full"
+    target_skill: str | None = None
     technical: float
     system_design: float
     behavioral: float
@@ -55,8 +58,23 @@ _report_state_by_channel: dict[str, dict] = {}
 _started_channels: set[str] = set()
 
 
+def clear_channel_state(channel: str) -> None:
+    _report_state_by_channel.pop(channel, None)
+    _started_channels.discard(channel)
+
+
 def has_report_started(channel: str) -> bool:
     return channel in _started_channels
+
+
+async def get_report_status_async(channel: str) -> dict:
+    if channel in _report_state_by_channel:
+        return _report_state_by_channel[channel]
+    res = await get_session_report_from_firestore(channel)
+    if res is not None:
+        _report_state_by_channel[channel] = res
+        return res
+    return {"status": "not_started", "report": None}
 
 
 def get_report_status(channel: str) -> dict:
@@ -70,9 +88,16 @@ def mark_not_applicable(channel: str) -> None:
     """
     _started_channels.add(channel)
     _report_state_by_channel[channel] = {"status": "not_applicable", "report": None}
+    asyncio.create_task(update_session_report(channel, "not_applicable"))
 
 
-def start_report_generation(channel: str, profile: InterviewProfile, messages: list[dict]) -> None:
+def start_report_generation(
+    channel: str,
+    profile: InterviewProfile,
+    messages: list[dict],
+    mode: str = "full",
+    target_skill: str | None = None,
+) -> None:
     """Fire-and-forget: kicks off report generation as a background task instead of
     awaiting it inline. This deliberately keeps evaluation off the conversational
     critical path (CLAUDE.md's own rule) — the candidate hears the goodbye line
@@ -80,7 +105,7 @@ def start_report_generation(channel: str, profile: InterviewProfile, messages: l
     """
     _started_channels.add(channel)
     _report_state_by_channel[channel] = {"status": "pending", "report": None}
-    asyncio.create_task(_generate_and_store(channel, profile, list(messages)))
+    asyncio.create_task(_generate_and_store(channel, profile, list(messages), mode, target_skill))
 
 
 def _build_transcript(messages: list[dict]) -> str:
@@ -95,9 +120,46 @@ def _build_transcript(messages: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _build_report_prompt(profile: InterviewProfile, messages: list[dict]) -> str:
+def _build_report_prompt(
+    profile: InterviewProfile,
+    messages: list[dict],
+    mode: str = "full",
+    target_skill: str | None = None,
+) -> str:
     transcript = _build_transcript(messages)
-    weak_topics, strong_topics = collect_interview_evidence(profile, messages)
+    weak_topics, strong_topics = collect_interview_evidence(
+        profile, messages, mode=mode, target_skill=target_skill
+    )
+
+    if mode == "focused" and target_skill:
+        return (
+            f"You are scoring a completed 5-to-15 minute FOCUSED PRACTICE DRILL for a {profile.role} role. "
+            f"This session was specifically dedicated to testing the candidate's mastery of: {target_skill}.\n\n"
+            f"TRANSCRIPT:\n{transcript}\n\n"
+            "During the drill, topic-tracking flagged these signals: "
+            f"topics answered weakly: {', '.join(weak_topics) or 'none flagged'}; "
+            f"topics answered with substance: {', '.join(strong_topics) or 'none flagged'}.\n\n"
+            f"Score the candidate specifically on their performance in this {target_skill} drill. "
+            "Do NOT penalize them for omitting unrelated interview stages (such as system design or behavioral rounds that were not part of this drill). "
+            "For 'overall', score their overall competence on this skill (0-10). "
+            "For 'technical', score their technical accuracy on this skill (0-10). "
+            "For 'system_design' and 'behavioral', score them proportionally to their overall performance or relevant aspects demonstrated. "
+            "For 'communication', score their clarity and articulateness (0-10). "
+            f"Provide 2 to 3 concise, concrete strengths specifically citing their answers about {target_skill}. "
+            f"Provide 2 to 3 targeted, actionable coaching tips/improvements for them to master {target_skill}. "
+            f"In 'summary', provide a 2-3 sentence coaching verdict on their readiness with {target_skill}.\n\n"
+            "Respond with ONLY a JSON object in this exact shape:\n"
+            "{\n"
+            '  "technical": <0-10 float>,\n'
+            '  "system_design": <0-10 float>,\n'
+            '  "behavioral": <0-10 float>,\n'
+            '  "communication": <0-10 float>,\n'
+            '  "overall": <0-10 float>,\n'
+            '  "strengths": [{"point": "<short label>", "evidence": "<what the candidate said>"}, ...],\n'
+            '  "improvements": [{"point": "<short label>", "evidence": "<actionable drill takeaway>"}, ...],\n'
+            '  "summary": "<2-3 sentence coaching summary>"\n'
+            "}\n"
+        )
 
     return (
         f"You are scoring a completed live voice interview for a {profile.role} role. "
@@ -156,7 +218,13 @@ async def _resolve_transcript(channel: str, messages: list[dict]) -> list[dict]:
     return history
 
 
-async def _generate_and_store(channel: str, profile: InterviewProfile, messages: list[dict]) -> None:
+async def _generate_and_store(
+    channel: str,
+    profile: InterviewProfile,
+    messages: list[dict],
+    mode: str = "full",
+    target_skill: str | None = None,
+) -> None:
     messages = await _resolve_transcript(channel, messages)
 
     # One retry: this call is off the conversational critical path, so a couple
@@ -166,9 +234,13 @@ async def _generate_and_store(channel: str, profile: InterviewProfile, messages:
     last_error: Exception | None = None
     for attempt, budget in enumerate(_TOKEN_BUDGETS):
         try:
-            report = await _call_groq_for_report(profile, messages, budget)
-            _report_state_by_channel[channel] = {"status": "ready", "report": report.model_dump()}
-            logger.info("[%s] REPORT ready: overall=%.1f", channel, report.overall)
+            report = await _call_groq_for_report(profile, messages, budget, mode, target_skill)
+            report_dict = report.model_dump()
+            report_dict["mode"] = mode
+            report_dict["target_skill"] = target_skill
+            _report_state_by_channel[channel] = {"status": "ready", "report": report_dict}
+            logger.info("[%s] REPORT ready: overall=%.1f (mode=%s skill=%s)", channel, report.overall, mode, target_skill)
+            asyncio.create_task(update_session_report(channel, "ready", report_dict))
             return
         except Exception as exc:
             last_error = exc
@@ -178,10 +250,15 @@ async def _generate_and_store(channel: str, profile: InterviewProfile, messages:
 
     logger.error("[%s] REPORT generation failed after retry", channel, exc_info=last_error)
     _report_state_by_channel[channel] = {"status": "failed", "report": None}
+    asyncio.create_task(update_session_report(channel, "failed"))
 
 
 async def _call_groq_for_report(
-    profile: InterviewProfile, messages: list[dict], budget: "_Budget"
+    profile: InterviewProfile,
+    messages: list[dict],
+    budget: "_Budget",
+    mode: str = "full",
+    target_skill: str | None = None,
 ) -> InterviewReport:
     client = get_http_client()
     response = await client.post(
@@ -189,25 +266,19 @@ async def _call_groq_for_report(
         headers={"Authorization": f"Bearer {settings.groq_api_key}"},
         json={
             "model": settings.groq_model,
-            "messages": [{"role": "user", "content": _build_report_prompt(profile, messages)}],
+            "messages": [
+                {"role": "user", "content": _build_report_prompt(profile, messages, mode, target_skill)}
+            ],
             "stream": False,
             "reasoning_effort": budget.reasoning_effort,
             "max_completion_tokens": budget.max_completion_tokens,
             "response_format": {"type": "json_object"},
         },
-        # Longer than the shared client's default 30s — this call is off the
-        # conversational critical path, so it's fine to give it room rather than
-        # risk a timeout on a longer, higher-effort completion.
         timeout=60.0,
     )
     if response.status_code != 200:
-        # raise_for_status() alone throws before the body is ever read, so a 400
-        # just shows up as an opaque "400 Bad Request" with no way to tell a
-        # too-long transcript apart from a rate limit or a bad request shape.
         raise ValueError(f"Groq report call failed {response.status_code}: {response.text[:800]!r}")
     body = response.json()
-    # Reasoning vs. completion split is the number that actually matters here:
-    # if reasoning_tokens creeps back toward the ceiling, this regresses.
     usage = body.get("usage") or {}
     logger.info(
         "REPORT usage: completion=%s (reasoning=%s) prompt=%s ceiling=%s",
@@ -223,6 +294,8 @@ async def _call_groq_for_report(
         raise ValueError(f"Report response was not valid JSON: {content[:300]!r}") from exc
 
     try:
+        parsed["mode"] = mode
+        parsed["target_skill"] = target_skill
         return InterviewReport.model_validate(parsed)
     except ValidationError as exc:
         raise ValueError(f"Report JSON didn't match expected shape: {parsed!r}") from exc

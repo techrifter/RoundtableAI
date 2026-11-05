@@ -17,5 +17,8 @@ class Settings(BaseSettings):
     # LLM, so it must be reachable from the internet.
     public_base_url: str
 
+    # Optional local service-account key. Production deployments should use ADC.
+    firebase_service_account_path: str = ""
+
 
 settings = Settings()

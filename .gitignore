@@ -3,6 +3,7 @@
 .kotlin/
 .idea/
 /local.properties
+/app/google-services.json
 .DS_Store
 /build
 /captures
@@ -14,3 +15,5 @@ backend/.env
 backend/__pycache__/
 backend/**/__pycache__/
 backend/.venv/
+backend/venv/
+backend/*firebase-adminsdk*.json
