@@ -1,266 +1,238 @@
 # Roundtable AI
 
-**Upload a job description. Get interviewed by an AI panel over live voice. Walk away with a scored, evidence-backed evaluation.**
+Roundtable AI is an Android application for voice-based interview practice. Candidates can
+provide a job description, a resume, or both; practice with a full interview panel or focus
+on a technical or system-design skill; and review AI-generated feedback from the session.
 
-Roundtable AI is an Android app that runs a real job interview. You hand it the JD you're applying against, or just your resume, and three specialist interviewers take turns questioning you in real time: technical, system design, then behavioral. You can interrupt them mid-sentence. They remember what you said two rounds ago and bring it back up. When it's over, you get scores with quotes from your own answers as evidence.
+## Product overview
 
----
+- **Role-aware interviews:** Documents are parsed into a structured profile used to tailor
+  interview questions.
+- **Full mock interviews:** Practice technical, system-design, and behavioral topics in a
+  live voice session.
+- **Focused practice:** Rehearse a selected technical or system-design skill.
+- **Live transcript:** Follow the conversation while speaking naturally and interrupting
+  the interviewer.
+- **Session feedback:** Review an evaluation informed by the interview conversation.
 
-## Demo
+|                         Prepare                         |                         Interview                         |                        Feedback                        |
+| :-----------------------------------------------------: | :-------------------------------------------------------: | :----------------------------------------------------: |
+| ![Interview setup screen](docs/screens/panelReady.webp) | ![Live interview screen](docs/screens/liveInterview.webp) | ![Interview feedback screen](docs/screens/report.webp) |
 
-> **[▶ Watch a full interview in 4 minutes](https://youtu.be/vLGOhcjKvqk)**
+[Watch a full interview demonstration](https://youtu.be/vLGOhcjKvqk)
 
-|            Panel ready            |            Live interview            |            Report            |
-| :-------------------------------: | :----------------------------------: | :---------------------------: |
-| ![](docs/screens/panelReady.webp) | ![](docs/screens/liveInterview.webp) | ![](docs/screens/report.webp) |
+## Architecture
 
----
-
-## Why this isn't a voice chatbot with an interview prompt
-
-The easy version of this project is one LLM told to "act like an interviewer." Here's what's actually different:
-
-**The interview is built from your documents.** A Groq call parses your JD and resume into a structured profile: role, required skills, system design topics, responsibilities, resume highlights. Every question the panel asks is generated against *that* profile, so applying for an Android role and applying for a data engineering role produce genuinely different interviews.
-
-**Three interviewers, and they share a memory.** When the System Design interviewer takes over, it's handed what you told the Technical interviewer. That means your exact words, plus the list of topics you already showed competence on. It's instructed to build on them rather than re-test them. So if you mention Kafka in round one, round two can open with *"Earlier you mentioned running Kafka in production. How would you handle message ordering as you scale consumers?"*
-
-**Who speaks next is decided by code, not by an LLM.** Asking the model "is this round done?" every turn would add a round-trip to a live conversation and make the interview's shape a guess. The orchestrator tracks it directly: time spent in the round, how deep it has gone on the current topic, weak answers in a row. Rounds only move forward, so the interview always reaches the end.
-
-**The panel adapts to how you're doing.** Answer a topic well and it digs into that topic instead of moving on, up to three follow-ups deep, then takes the next thing on the JD. Say "I've never used that" and it drops the topic straight away. Say it multiple times in a row and the round ends early.
-
-**Each interviewer has a different voice.** Per-persona TTS voice IDs are pushed to Agora mid-session, so the handoff between rounds is something you *hear*, not just something the transcript claims.
-
----
-
-## How it works
-
-```
-┌──────────────────────────────┐
-│   Android app (Compose)      │
-│   upload · voice · live      │         ┌──────────────────────────┐
-│   transcript · report        │◄───────►│  Agora Conversational AI │
-└──────────────┬───────────────┘  RTC    │  ASR ─ LLM ─ TTS ─ VAD   │
-               │                  RTM    └────────────┬─────────────┘
-               │ REST                                 │
-               │                        custom LLM    │ transcripts,
-               │                        callback      │ agent state
-               ▼                                      ▼ (over RTM)
-┌───────────────────────────────────────────────────────────────────┐
-│                      FastAPI backend                              │
-│                                                                   │
-│   /jd/upload ──► Groq ──► InterviewProfile                        │
-│   /session/start ──► mint tokens ──► start Agora agent            │
-│   /chat/completions ◄── Agora calls this every single turn        │
-│        │                                                          │
-│        ├─ signals.py      which JD topics did that answer touch?  │
-│        ├─ orchestrator.py which stage are we in? who speaks next? │
-│        ├─ agents/         build that persona's system prompt      │
-│        └─ Groq (streamed) ──► sanitized ──► back to Agora         │
-│                                                                   │
-│   /session/{ch}/report ──► background Groq call ──► scores        │
-└───────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    Android[Android app<br/>Compose, RTC, RTM] <-->|HTTPS REST| API[FastAPI backend]
+    Android <-->|RTC audio / RTM events| Agora[Agora Conversational AI]
+    API -->|Start and control agent| Agora
+    Agora -->|OpenAI-compatible streaming request| LLM[Backend custom LLM endpoint]
+    LLM --> Orchestrator[Interview orchestration]
+    LLM --> Groq[Groq]
+    API --> Groq
+    API --> Firebase[Firebase Authentication]
+    API --> Store[Cloud Firestore]
+    Agora --> Speech[Speech services<br/>Deepgram / MiniMax]
 ```
 
-Agora runs the conversation: microphone capture, speech recognition, voice activity detection, barge-in, and speech synthesis. The backend is registered as Agora's **custom LLM**, so every turn of the conversation comes to us as an OpenAI-shaped `/chat/completions` request. That's the hook the whole product hangs on. It's where we decide which interviewer is speaking and what they know.
+### Request and interview lifecycle
 
-### One turn, end to end
+1. The Android app authenticates with Firebase and sends the user's Firebase ID token to
+   authenticated backend endpoints.
+2. The app uploads a job description and/or resume to `POST /jd/upload`. The backend
+   extracts text, creates a structured interview profile, persists it, and returns a
+   `profile_id`.
+3. The app requests `POST /session/start`. The backend checks the user's interview
+   allowance, creates a session, generates channel-scoped Agora tokens, and starts the
+   Conversational AI agent.
+4. During the live interview, Agora sends conversation turns to the backend's
+   OpenAI-compatible `POST /chat/completions` endpoint. The orchestrator selects the
+   interview stage and persona, then streams the generated response back to Agora.
+5. Transcript and agent-state events are delivered to Android over RTM. The app polls
+   session endpoints for stage and report status.
+6. When the session ends, the backend generates a structured report and persists the
+   result for the app to retrieve.
 
-1. You finish speaking. Agora's VAD detects end-of-speech (semantic mode, 550ms silence window).
-2. Agora transcribes and `POST`s the conversation to our `/chat/completions`.
-3. `signals.py` scans your answer for JD keywords and low-engagement phrases. No LLM, just string matching.
-4. `orchestrator.py` replays every answer so far through the stage rules and returns the current stage.
-5. The matching persona builder assembles a system prompt: JD profile + prior-round quotes + topics you've already nailed.
-6. That prompt replaces the system message. We stream Groq's reply back to Agora as SSE, sanitizing each chunk.
-7. First chunk carries `custom_metadata` switching the TTS voice to this persona's.
-8. Agora speaks it. Transcripts arrive on the phone over RTM and render live.
+### Interview orchestration
 
-Steps 3 to 5 add no network calls. The only thing on the critical path is LLM.
+The full interview progresses through technical, system-design, and behavioral stages.
+Focused practice selects either the technical or system-design stage based on the chosen
+skill. Backend orchestration applies stage and topic rules to the conversation and builds
+the corresponding interviewer prompt. Reports include overall and category scores,
+strengths, improvement areas, and a summary.
 
-### The stage machine
+## Repository layout
 
+```text
+app/
+  src/main/java/com/techrifter/roundtableai/
+    auth/          Firebase authentication and sign-in UI
+    interview/     Interview setup, live session, transcript, and report UI
+    network/       Backend API client and response models
+backend/
+  app/
+    api/           FastAPI route handlers
+    agents/        Interview persona prompt builders
+    orchestration/ Stage selection and answer/topic analysis
+    evaluation/    Report generation and persistence
+    services/      Document parsing, AI clients, Agora agent and token helpers
+    static/        Privacy and account-deletion pages
+    models/        Pydantic data models
+  tests/           Backend unit tests
+docs/
+  screens/         Product screenshots
 ```
-TECHNICAL ──► SYSTEM_DESIGN ──► BEHAVIORAL ──► FINAL_EVAL
-```
 
-Each round gets a time budget sized to what the round is worth, not an equal split:
+## API overview
 
-| Round         | Budget       | Depth per topic |
-| ------------- | ------------ | --------------- |
-| Technical     | 15 to 20 min | 3 follow-ups    |
-| System design | 10 to 15 min | 3 follow-ups    |
-| Behavioral    | 5 to 7 min   | 2 follow-ups    |
+Authenticated routes require a Firebase ID token in the `Authorization` header. The
+Agora callback and public routes do not use app-user authentication.
 
-The orchestrator holds one topic at a time and passes it into the persona's prompt, so the interviewer is told what to ask about rather than choosing for itself. It counts how deep the round has gone on that topic, and when the depth runs out the next uncovered item on the JD becomes the focus. If the candidate steers somewhere else on their own, whatever they actually talked about gets marked covered too, so the panel doesn't circle back to it later.
+| Method     | Path                               | Purpose                                                                 |
+| :--------- | :--------------------------------- | :---------------------------------------------------------------------- |
+| `GET`    | `/health`                        | Backend health response.                                                |
+| `POST`   | `/jd/upload`                     | Parse a job description and/or resume; returns a profile.               |
+| `GET`    | `/session/limits`                | Return the authenticated user's rolling 24-hour interview allowance.    |
+| `POST`   | `/session/start`                 | Start a full or focused interview; returns Agora connection details.    |
+| `GET`    | `/session/{channel_name}/stage`  | Retrieve the current interview stage.                                   |
+| `GET`    | `/session/{channel_name}/report` | Retrieve report-generation status and report data.                      |
+| `POST`   | `/session/{channel_name}/end`    | End the session and request its evaluation.                             |
+| `POST`   | `/chat/completions`              | Agora custom-LLM callback; streams OpenAI-compatible response chunks.   |
+| `POST`   | `/user/waitlist`                 | Add the authenticated user to the Pro early-access waitlist.            |
+| `DELETE` | `/user/account`                  | Queue deletion of the authenticated user's account and associated data. |
+| `GET`    | `/privacy`                       | Serve the privacy policy.                                               |
+| `GET`    | `/account-deletion`              | Serve account-deletion instructions.                                    |
 
-A full interview runs about 30 to 40 minutes. Turn counts are bounded on both sides, so a silent candidate can't skip a round in seconds and a talkative one can't run forever.
+Interactive API documentation is available at `/docs` when the backend is running.
 
-Current stage and topic are recalculated on every turn by replaying the answers in order, so the panel's state always matches what was actually said. The answers themselves are held by the backend, since a single request carries only recent history and a round measured in minutes needs to look further back.
+## Data and privacy
 
-### Cross-agent memory
+Firestore stores user-owned interview profiles and session records, including report
+status and generated feedback. The service also uses Firestore for interview allowance,
+waitlist, and account-deletion processing. Uploaded document files are processed to
+extract an interview profile; the backend stores the extracted profile rather than an
+archive of the original files. See the [Privacy Policy](https://sites.google.com/view/roundtableai-privacy-policy)
+and [Account Deletion information](https://sites.google.com/view/roundtableai-deletion-policy)
+for user-facing details.
 
-Two things cross the round boundary:
+Free accounts can start two interviews in a rolling 24-hour period. Document upload and
+analysis do not count as an interview; starting one does.
 
-- **Your exact words.** Up to 3 of your earlier answers, sampled *evenly* across the conversation rather than taking the most recent ones. A tail slice would drop your opening answers, and the claim worth calling back to is usually made early.
-- **Demonstrated topics.** The strong-answer list the orchestrator already built for routing, reused rather than re-derived. The next persona is told what not to re-test.
+## Technology
 
----
+- **Android:** Kotlin, Jetpack Compose, AndroidX, Kotlin coroutines
+- **Authentication:** Firebase Authentication
+- **Backend:** Python 3.11+, FastAPI, Pydantic, Uvicorn
+- **Persistence:** Cloud Firestore through Firebase Admin SDK
+- **Voice:** Agora RTC, RTM, and Conversational AI
+- **AI and speech:** Groq, Deepgram, and MiniMax
 
-## Reliability
+## Development setup
 
-Everything here exists because it broke during testing.
+### Prerequisites
 
-**The model needed deterministic guardrails.** llm might not reliably follow instructions, so each failure has a code-level backstop rather than firmer prompt wording:
-
-| Failure                                                 | Backstop                                                          |
-| ------------------------------------------------------- | ----------------------------------------------------------------- |
-| Asks 4 questions in one turn                            | Response truncated after the 3rd question mark                    |
-| Asks a question in its greeting                         | Opening line is buffered, questions stripped,*then* sent to TTS |
-| Emits`reasoning`/`channel` deltas Agora can't parse | Stripped from every chunk before forwarding                       |
-| Em dashes and curly quotes that TTS mispronounces       | Sanitized per chunk                                               |
-
-**Failures degrade instead of dropping the call.** A Groq error becomes a spoken *"Sorry, could you say that again?"* rather than dead air. `httpx` doesn't raise on non-2xx and an error body isn't SSE-shaped, so unhandled it produced silence. If RTM login fails you lose live captions but the interview continues. If report generation fails, you get an honest failure state, not a spinner.
-
-**Evaluation never blocks speech.** Scoring is `asyncio.create_task`'d the moment the interview reaches `FINAL_EVAL`. You hear the goodbye line immediately while the report generates behind it, and the app polls for it.
-
-**Ending early still produces a real report.** Tap End at any point and whatever happened gets scored, with the prompt instructed to mark thin sections down rather than guess. Only a genuinely empty interview returns `not_applicable`.
-
-**The report reads the full transcript.** Agora caps what it forwards to the custom LLM, so on a long interview the technical round has already scrolled out of the window by scoring time. The report fetches the complete conversation from Agora's history endpoint instead, falling back to the forwarded messages if that call fails.
-
----
-
-## Agora integration
-
-| Capability                         | Where it's used                                                                                                                       |
-| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| **Conversational AI Engine** | Runs the interview. Backend is the custom LLM, called every turn.                                                                     |
-| **Voice Calling (RTC)**      | The live audio session.`AUDIO_SCENARIO_AI_CLIENT`, AI echo cancellation loaded as an extension for barge-in over the phone speaker. |
-| **Signaling (RTM)**          | Transcript and agent-state delivery, and per-turn ASR/LLM/TTS latency metrics.                                                        |
-| **Agent client toolkit**     | `ConversationalAIAPIImpl` on Android for transcript and state events.                                                               |
-
-Four settings are easy to miss on a first integration. Noting them here for anyone building on the same stack:
-
-- `enable_rtm` belongs under `advanced_features`, not at the top level. The join succeeds either way, so it's worth double-checking the nesting.
-- `parameters.data_channel` defaults to `datastream`. Set it to `"rtm"` to receive transcripts over Signaling, which is what the app renders from.
-- `llm.output_modalities` should be `["text", "audio"]`, so the agent publishes both the spoken audio and the text events the live transcript is built from.
-- The agent's token needs both RTC and RTM services in a single AccessToken2. With `enable_rtm` set, the agent reuses the `token` field for its RTM login rather than taking a second one.
-
-Tokens are minted server-side only. The app ships no Agora credentials. It receives finished, channel-scoped tokens at runtime.
-
----
-
-## Running it
-
-**You need:** Android Studio, Python 3.11+, a physical Android device (emulator mic input is unreliable), an [Agora account](https://console.agora.io) with Conversational AI enabled, and a [Groq API key](https://console.groq.com/keys).
+- Android Studio and an Android device or emulator with microphone support
+- Python 3.11 or later
+- Firebase project with Email/Password and Google Authentication enabled and Firestore
+- Agora project with Conversational AI enabled
+- Groq API key
 
 ### Backend
 
+Create and activate a virtual environment, then install the backend dependencies.
+
+**macOS/Linux**
+
 ```bash
 cd backend
-python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env        # then fill it in; each line says where to get the value
-python -m uvicorn app.main:app --port 8000 --reload
 ```
 
-Enable Email/Password and Google sign-in in Firebase Authentication. Add the Android app's
-SHA-1/SHA-256 signing fingerprints in Firebase, then keep the generated
-`app/google-services.json` in place. It contains public client configuration, not a server
-credential; restrict its API key to this Android app and the APIs it needs.
+**Windows PowerShell**
 
-For local backend development, set `FIREBASE_SERVICE_ACCOUNT_PATH` in `backend/.env` to a
-service-account JSON file. Never commit that private key. On Google Cloud, leave the setting
-empty and grant the deployed service an appropriate identity; the Firebase Admin SDK will use
-Application Default Credentials for Firebase Auth verification and Firestore access.
+```powershell
+cd backend
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
 
-Account deletion requests are persisted in Firestore. While the API process is running, an
-in-process worker polls the queue every hour, retries failures with backoff, and
-resumes queued or expired-lease requests after restarts. Multiple API instances are safe:
-Firestore leases prevent the same request from being processed concurrently. For deployments
-where the API may sleep or stop for long periods, configure a scheduler to run
-`cd backend && python -m app.worker` every hour; this one-shot worker uses the same
-queue and retry logic. 
-The public privacy policy is
-https://sites.google.com/view/roundtableai-privacy-policy, and the external account-deletion
-request page is https://sites.google.com/view/roundtableai-deletion-policy. Use these HTTPS
-URLs in the Play Store listing and Data safety account-deletion fields. The backend also
-serves copies at `/privacy` and `/account-deletion`.
-
-By default, account deletion removes the user's Firebase Auth account and all owned profiles,
-sessions, reports, quota data, and waitlist entry. For a specific legal obligation or claim,
-trusted project administrators may create `legal_holds/{uid}` in Firestore with a non-empty
-`reason`, an `expires_at_epoch` (UTC Unix seconds), and explicit `profile_ids` and
-`session_ids` arrays. Only those listed profile/session documents are retained; Auth, quota,
-and waitlist data are still deleted. Administrators must remove retained documents and the
-hold record when the legal need ends; this project does not run an automatic legal-hold expiry
-job.
-
-Agora calls your backend mid-conversation, so it needs a public HTTPS URL:
+From the repository root, copy `backend/.env.example` to `backend/.env`:
 
 ```bash
-ngrok http 8000
+cp backend/.env.example backend/.env
 ```
 
-Put that URL in `.env` as `PUBLIC_BASE_URL`.
+In PowerShell, use:
 
-### Android app
-
-Create `local.properties` in the project root (it's gitignored) and point it at the same tunnel:
-
-```properties
-backend.baseUrl=https://your-tunnel.ngrok-free.dev
+```powershell
+Copy-Item backend\.env.example backend\.env
 ```
 
-Then run the app. Grant microphone permission, pick a JD or resume, tap **Analyze documents**, confirm the extracted role, and **Begin session**.
+Then configure:
 
-### Free interview allowance
+| Variable                          | Purpose                                                                 |
+| :-------------------------------- | :---------------------------------------------------------------------- |
+| `GROQ_API_KEY`                  | Groq API credential.                                                    |
+| `GROQ_MODEL`                    | Model identifier used by profile, interview, and report generation.     |
+| `AGORA_APP_ID`                  | Agora application identifier.                                           |
+| `AGORA_APP_CERTIFICATE`         | Server-side Agora token-signing credential.                             |
+| `AGORA_CUSTOMER_ID`             | Agora Conversational AI REST API credential.                            |
+| `AGORA_CUSTOMER_SECRET`         | Agora Conversational AI REST API credential.                            |
+| `PUBLIC_BASE_URL`               | Public HTTPS URL used by Agora to call the backend custom-LLM endpoint. |
+| `FIREBASE_SERVICE_ACCOUNT_PATH` | Optional path to a local Firebase service-account JSON file.            |
 
-The free plan allows two interviews in a rolling 24-hour window. Uploading or analyzing
-documents does not use an interview; starting one does. A completed focused-practice retry
-is a new interview and counts toward the same allowance. If agent startup fails, that failed
-attempt can be retried within 15 minutes without consuming an additional slot. The backend
-enforces the allowance transactionally in Firestore; if Firestore is unavailable, starting
-an interview fails closed rather than bypassing the limit.
+Keep `.env` and service-account credentials out of version control. For Google Cloud
+deployments, use the service identity and Application Default Credentials instead of
+shipping a service-account key.
 
-### API
+Run the backend from the `backend/` directory:
 
-| Endpoint                     | Purpose                                                                 |
-| ---------------------------- | ----------------------------------------------------------------------- |
-| `POST /jd/upload`          | PDF/DOCX → structured profile. Returns`profile_id`.                  |
-| `POST /session/start`      | Mints tokens, starts the Agora agent, binds the profile to the channel. |
-| `POST /chat/completions`   | **Agora calls this.** Persona routing and streaming happen here.  |
-| `GET /session/{ch}/stage`  | Which interviewer is currently speaking.                                |
-| `POST /session/{ch}/end`   | Triggers scoring for however far the interview got.                     |
-| `GET /session/{ch}/report` | `pending` → `ready` \| `failed` \| `not_applicable`.           |
-
----
-
-## Project layout
-
-```
-backend/app/
-├── api/
-│   ├── llm.py            custom-LLM endpoint: routing, streaming, TTS safeguards
-│   ├── session.py        session lifecycle, tokens, agent start
-│   └── jd.py             upload → profile
-├── orchestration/
-│   ├── orchestrator.py   the stage machine + cross-agent memory
-│   └── signals.py        deterministic per-answer analysis
-├── agents/               three persona builders + shared speech rules
-├── evaluation/report.py  background scoring, evidence-backed
-├── services/             Agora agent config, token minting, Groq, doc parsing
-└── models/               InterviewProfile
-
-app/src/main/java/com/techrifter/roundtableai/
-├── interview/
-│   ├── InterviewViewModel.kt   RTC + RTM + toolkit lifecycle, audio tuning
-│   └── InterviewScreen.kt      pre-join / live / report, custom Canvas visualizer
-└── network/SessionApi.kt       backend client
+```bash
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-**Stack:** Kotlin · Jetpack Compose · Agora RTC 4.6.3 + RTM 2.3.0 · FastAPI · Pydantic · Groq (`gpt-oss-20b`) · Deepgram `nova-3` ASR · MiniMax `speech-2.8-turbo` TTS. minSdk 26.
+Agora must be able to reach `PUBLIC_BASE_URL` over HTTPS. For local development, expose
+the backend through a secure tunnel and use that tunnel's URL.
 
----
+### Android
+
+1. Register the Android app in Firebase, enable the sign-in providers, configure signing
+   fingerprints, and add the generated `google-services.json` to `app/`.
+2. Create `local.properties` in the repository root:
+
+   ```properties
+   backend.baseUrl=https://your-backend.example.com
+   ```
+3. Open the project in Android Studio, sync Gradle, and run the `app` configuration.
+   Grant microphone permission when prompted.
+
+Gradle reads `backend.baseUrl` during the build and embeds it in `BuildConfig`. Set it to
+the intended backend before building an APK or app bundle.
+
+### Tests and builds
+
+Run backend unit tests from the `backend/` directory:
+
+```bash
+python -m unittest discover -s tests
+```
+
+Build the Android debug variant from the repository root using the Gradle wrapper:
+
+```bash
+.\gradlew.bat :app:assembleDebug
+```
+
+On macOS/Linux, use `./gradlew :app:assembleDebug`.
 
 ## License
 
-Code released under the [MIT License](https://github.com/techrifter/roundtableai/blob/main/LICENSE). Token generation under `backend/app/services/agora_access_token/` is vendored from [AgoraIO/Tools](https://github.com/AgoraIO/Tools) (MIT), with modifications noted in the file headers.
+This project is released under the [MIT License](LICENSE). Agora access-token code under
+`backend/app/services/agora_access_token/` is derived from
+[AgoraIO/Tools](https://github.com/AgoraIO/Tools) and includes attribution in its source
+files.
