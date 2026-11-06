@@ -4,10 +4,12 @@ import android.app.Application
 import android.net.Uri
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.techrifter.roundtableai.network.InterviewProfilePreview
 import com.techrifter.roundtableai.network.InterviewReport
 import com.techrifter.roundtableai.network.SessionApi
+import com.techrifter.roundtableai.network.UserLimits
 import io.agora.conversational.api.AgentState
 import io.agora.conversational.api.ConversationalAIAPIConfig
 import io.agora.conversational.api.ConversationalAIAPIImpl
@@ -26,16 +28,21 @@ import io.agora.rtc2.RtcEngineConfig
 import io.agora.rtc2.RtcEngineEx
 import io.agora.rtm.RtmClient
 import io.agora.rtm.RtmConfig
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 private const val TAG = "RoundtableRTM"
 
 enum class InterviewStatus {
     IDLE, REQUESTING_SESSION, JOINING, LIVE, REPORT, ERROR
 }
+
+enum class InterviewMode { FULL, FOCUSED }
 
 enum class SignalStatus { CONNECTING, CONNECTED, FAILED }
 
@@ -58,8 +65,12 @@ data class ProfileUiState(
     val errorMessage: String? = null,
 )
 
-class InterviewViewModel(application: Application) : AndroidViewModel(application) {
-    private val sessionApi = SessionApi()
+class InterviewViewModel(
+    application: Application,
+    tokenProvider: suspend () -> String?,
+) : AndroidViewModel(application) {
+
+    private val sessionApi = SessionApi(tokenProvider)
     private var rtcEngine: RtcEngineEx? = null
     private var rtmClient: RtmClient? = null
     private var conversationalApi: ConversationalAIAPIImpl? = null
@@ -96,16 +107,68 @@ class InterviewViewModel(application: Application) : AndroidViewModel(applicatio
     private val _profileState = MutableStateFlow(ProfileUiState())
     val profileState: StateFlow<ProfileUiState> = _profileState
 
+    private val _userLimits = MutableStateFlow<UserLimits?>(null)
+    val userLimits: StateFlow<UserLimits?> = _userLimits
+    private val _isRefreshingLimits = MutableStateFlow(false)
+    val isRefreshingLimits: StateFlow<Boolean> = _isRefreshingLimits
+    private var limitsRequestId = 0
+
+    private val _selectedMode = MutableStateFlow(InterviewMode.FOCUSED)
+    val selectedMode: StateFlow<InterviewMode> = _selectedMode
+
+    private val _selectedSkill = MutableStateFlow<String?>(null)
+    val selectedSkill: StateFlow<String?> = _selectedSkill
+
+    fun selectMode(mode: InterviewMode) {
+        _selectedMode.value = mode
+    }
+
+    fun selectSkill(skill: String) {
+        _selectedSkill.value = skill
+    }
+
     private var candidateUid: Int = 0
     private var channelName: String = ""
     private var stagePollJob: kotlinx.coroutines.Job? = null
+    private val closingTranscriptTurnIds = ConcurrentHashMap.newKeySet<Long>()
+    private val finishedAgentTurnIds = ConcurrentHashMap.newKeySet<Long>()
+    private val isEndingInterview = AtomicBoolean(false)
 
     // Keyed by "turnId-type" and kept in insertion order, per Agora's own reference
     // pattern for upserting streaming transcript rows as they arrive/finalize.
     private val transcriptByKey = LinkedHashMap<String, TranscriptEntry>()
 
     init {
-        viewModelScope.launch { sessionApi.warmUp() }
+        viewModelScope.launch {
+            sessionApi.warmUp()
+            refreshUserLimits()
+        }
+    }
+
+    fun refreshUserLimits() {
+        val requestId = ++limitsRequestId
+        _isRefreshingLimits.value = true
+        viewModelScope.launch {
+            try {
+                val limits = sessionApi.getUserLimits()
+                if (requestId == limitsRequestId) {
+                    _userLimits.value = limits
+                }
+            } finally {
+                if (requestId == limitsRequestId) {
+                    _isRefreshingLimits.value = false
+                }
+            }
+        }
+    }
+
+    suspend fun joinWaitlist(): Boolean {
+        val success = sessionApi.joinWaitlist()
+        if (success) {
+            _userLimits.value = _userLimits.value?.copy(hasJoinedWaitlist = true)
+            refreshUserLimits()
+        }
+        return success
     }
 
     private val rtcEventHandler = object : IRtcEngineEventHandler() {
@@ -180,6 +243,15 @@ class InterviewViewModel(application: Application) : AndroidViewModel(applicatio
                 isFinal = transcript.status.name == "END",
             )
             _transcript.value = transcriptByKey.values.sortedBy { it.turnId }
+            val normalizedText = transcript.text
+                .lowercase()
+                .replace('\u2019', '\'')
+            val isClosingMessage = normalizedText.contains("that's everything from the panel") ||
+                normalizedText.contains("that wraps up our focused practice drill on")
+            if (speaker == Speaker.AGENT && transcript.status.name == "END" && isClosingMessage) {
+                closingTranscriptTurnIds.add(transcript.turnId)
+                finishInterviewAfterAgentTurn(transcript.turnId)
+            }
         }
 
         override fun onAgentInterrupted(agentUserId: String, event: io.agora.conversational.api.InterruptEvent) {}
@@ -189,6 +261,8 @@ class InterviewViewModel(application: Application) : AndroidViewModel(applicatio
             // Latency breakdown is useful for our own debugging, not for the
             // candidate's screen — logged only, not surfaced in the UI.
             Log.d(TAG, "onTurnFinished: turnId=${turn.turnId} e2e=${turn.e2eLatency}ms")
+            finishedAgentTurnIds.add(turn.turnId)
+            finishInterviewAfterAgentTurn(turn.turnId)
         }
         override fun onAgentError(agentUserId: String, error: io.agora.conversational.api.ModuleError) {}
         override fun onMessageError(agentUserId: String, error: io.agora.conversational.api.MessageError) {}
@@ -239,6 +313,9 @@ class InterviewViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             try {
                 val result = sessionApi.uploadJd(getApplication(), jdUri, resumeUri)
+                if (_selectedSkill.value == null) {
+                    _selectedSkill.value = result.profile.skills.firstOrNull()
+                }
                 _profileState.value = ProfileUiState(
                     status = ProfileStatus.READY,
                     profileId = result.profileId,
@@ -264,11 +341,26 @@ class InterviewViewModel(application: Application) : AndroidViewModel(applicatio
         ) {
             return
         }
+        isEndingInterview.set(false)
+        closingTranscriptTurnIds.clear()
+        finishedAgentTurnIds.clear()
         _uiState.value = InterviewUiState(status = InterviewStatus.REQUESTING_SESSION)
+
+        val mode = if (_selectedMode.value == InterviewMode.FOCUSED) "focused" else "full"
+        val targetSkill = if (_selectedMode.value == InterviewMode.FOCUSED) _selectedSkill.value else null
 
         viewModelScope.launch {
             try {
-                val session = sessionApi.startSession(profileId)
+                val session = sessionApi.startSession(profileId,     mode, targetSkill)
+                _userLimits.value = _userLimits.value?.let { limits ->
+                    val used = limits.usedToday + 1
+                    limits.copy(
+                        usedToday = used,
+                        remaining = (limits.dailyLimit - used).coerceAtLeast(0),
+                        canStart = used < limits.dailyLimit,
+                    )
+                }
+                refreshUserLimits()
                 _uiState.value = _uiState.value.copy(status = InterviewStatus.JOINING)
                 joinChannel(
                     appId = session.appId,
@@ -278,6 +370,7 @@ class InterviewViewModel(application: Application) : AndroidViewModel(applicatio
                     rtmToken = session.rtmToken,
                 )
             } catch (t: Throwable) {
+                refreshUserLimits()
                 _uiState.value = InterviewUiState(
                     status = InterviewStatus.ERROR,
                     errorMessage = t.message ?: "Failed to start session",
@@ -319,7 +412,15 @@ class InterviewViewModel(application: Application) : AndroidViewModel(applicatio
             clientRoleType = Constants.CLIENT_ROLE_BROADCASTER
             channelProfile = Constants.CHANNEL_PROFILE_LIVE_BROADCASTING
         }
-        engine.joinChannel(token, channelName, uid, options)
+        val joinResult = engine.joinChannel(token, channelName, uid, options)
+        if (joinResult != 0) {
+            Log.e(TAG, "engine.joinChannel returned error: $joinResult")
+            _uiState.value = InterviewUiState(
+                status = InterviewStatus.ERROR,
+                errorMessage = "Failed to connect to voice channel (error $joinResult)",
+            )
+            return
+        }
 
         setUpTranscripts(engine, appId, uid, rtmToken, channelName)
     }
@@ -388,7 +489,17 @@ class InterviewViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    private fun finishInterviewAfterAgentTurn(turnId: Long) {
+        if (turnId !in closingTranscriptTurnIds || turnId !in finishedAgentTurnIds) return
+        viewModelScope.launch(Dispatchers.Main.immediate) {
+            if (_uiState.value.status == InterviewStatus.LIVE) {
+                endInterview()
+            }
+        }
+    }
+
     fun endInterview() {
+        if (!isEndingInterview.compareAndSet(false, true)) return
         val endedChannel = channelName
         stagePollJob?.cancel()
         stagePollJob = null
@@ -410,17 +521,14 @@ class InterviewViewModel(application: Application) : AndroidViewModel(applicatio
         _localAudioLevel.value = 0f
         _agentAudioLevel.value = 0f
         _currentPersona.value = null
-        // Report generation is kicked off server-side once the panel reaches its
-        // final stage, well before the candidate taps End in most cases — so this
-        // screen is usually just a short wait, not a cold start.
+        closingTranscriptTurnIds.clear()
+        finishedAgentTurnIds.clear()
         _report.value = ReportUiState()
         _uiState.value = InterviewUiState(status = InterviewStatus.REPORT)
         viewModelScope.launch {
-            // Tells the backend to score whatever was covered, so ending early still
-            // yields a report. Best-effort — the poll loop below reflects real state
-            // either way.
             sessionApi.endSession(endedChannel)
             startReportPolling(endedChannel)
+            refreshUserLimits()
         }
     }
 
@@ -430,8 +538,6 @@ class InterviewViewModel(application: Application) : AndroidViewModel(applicatio
             return
         }
         viewModelScope.launch {
-            // Up to ~2 minutes: report generation is one off-critical-path LLM
-            // call, but Groq latency/rate limits can occasionally push it out.
             repeat(60) {
                 val result = sessionApi.getReport(channelName)
                 if (result != null) {
@@ -440,9 +546,6 @@ class InterviewViewModel(application: Application) : AndroidViewModel(applicatio
                 }
                 delay(2000)
             }
-            // Covers every non-terminal status ("pending" and "not_started" alike)
-            // rather than only "pending" — a status the backend never resolves
-            // would otherwise poll forever with no exit.
             if (_report.value.status !in TERMINAL_REPORT_STATUSES) {
                 _report.value = _report.value.copy(status = "failed")
             }
@@ -453,10 +556,23 @@ class InterviewViewModel(application: Application) : AndroidViewModel(applicatio
         val TERMINAL_REPORT_STATUSES = setOf("ready", "failed", "not_applicable")
     }
 
+    /** Retries a focused practice drill on the targeted skill. */
+    fun retryCurrentDrill(targetSkill: String? = null) {
+        if (targetSkill != null) {
+            _selectedSkill.value = targetSkill
+        }
+        _selectedMode.value = InterviewMode.FOCUSED
+        _report.value = ReportUiState()
+        _uiState.value = InterviewUiState(status = InterviewStatus.IDLE)
+        refreshUserLimits()
+        startInterview()
+    }
+
     /** Leaves the report screen and resets to the pre-join state for another run. */
     fun startNewInterview() {
         _report.value = ReportUiState()
         _uiState.value = InterviewUiState(status = InterviewStatus.IDLE)
+        refreshUserLimits()
     }
 
     override fun onCleared() {
@@ -466,5 +582,15 @@ class InterviewViewModel(application: Application) : AndroidViewModel(applicatio
         rtcEngine?.leaveChannel()
         RtcEngine.destroy()
         rtcEngine = null
+    }
+
+    /** Factory to inject the token provider into the ViewModel without Hilt. */
+    class Factory(
+        private val application: Application,
+        private val tokenProvider: suspend () -> String?,
+    ) : ViewModelProvider.Factory {
+        @Suppress("UNCHECKED_CAST")
+        override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T =
+            InterviewViewModel(application, tokenProvider) as T
     }
 }

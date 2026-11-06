@@ -27,6 +27,10 @@ def get_agent_id(channel: str) -> str | None:
     return _agent_id_by_channel.get(channel)
 
 
+def forget_agent_id(channel: str) -> None:
+    _agent_id_by_channel.pop(channel, None)
+
+
 def _basic_auth_header() -> str:
     raw = f"{settings.agora_customer_id}:{settings.agora_customer_secret}".encode()
     return f"Basic {base64.b64encode(raw).decode()}"
@@ -150,8 +154,8 @@ async def fetch_agent_history(agent_id: str) -> list[dict]:
     last 20 messages, so on a long interview the Technical round has already fallen
     out by the time the report is built. This returns everything since agent start.
 
-    Only callable while the agent is still running, which holds here — nothing calls
-    stop_agent(), so the agent lives until its idle_timeout.
+    Only callable while the agent is still running. Normal interview completion lets the
+    agent reach its idle timeout; account deletion may stop it earlier.
     """
     url = (
         f"https://api.agora.io/api/conversational-ai-agent/v2/projects/"
@@ -176,4 +180,6 @@ async def stop_agent(agent_id: str) -> None:
     )
     async with httpx.AsyncClient(timeout=15.0) as client:
         response = await client.post(url, headers={"Authorization": _basic_auth_header()})
+        if response.status_code == 404:
+            return
         response.raise_for_status()

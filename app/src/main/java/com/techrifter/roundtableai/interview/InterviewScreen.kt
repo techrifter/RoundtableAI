@@ -1,8 +1,10 @@
 package com.techrifter.roundtableai.interview
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
@@ -18,6 +20,7 @@ import androidx.compose.animation.core.tween
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -38,11 +41,13 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -51,6 +56,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -68,16 +74,19 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.techrifter.roundtableai.R
 import com.techrifter.roundtableai.network.EvidencePoint
 import com.techrifter.roundtableai.network.InterviewProfilePreview
 import com.techrifter.roundtableai.network.InterviewReport
+import com.techrifter.roundtableai.network.UserLimits
 import com.techrifter.roundtableai.network.resolveDisplayName
 import io.agora.conversational.api.AgentState
 import kotlin.math.sin
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 // Duotone by design: near-black plus one signature hue. Agent state is shown through
 // the orb's brightness and motion, never by swapping hue — don't add per-state colors.
@@ -93,7 +102,7 @@ private val SignatureDim = Color(0xFF2B2044)
 private val Danger = Color(0xFFFF4D6D)
 
 @OptIn(ExperimentalTextApi::class)
-private val Inter = FontFamily(
+internal val Inter = FontFamily(
     Font(R.font.inter_variable, weight = FontWeight.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(400))),
     Font(R.font.inter_variable, weight = FontWeight.Medium, variationSettings = FontVariation.Settings(FontVariation.weight(500))),
     Font(R.font.inter_variable, weight = FontWeight.SemiBold, variationSettings = FontVariation.Settings(FontVariation.weight(600))),
@@ -338,7 +347,14 @@ private fun lerp(a: Color, b: Color, t: Float): Color {
 }
 
 @Composable
-fun InterviewScreen(modifier: Modifier = Modifier, viewModel: InterviewViewModel = viewModel()) {
+fun InterviewScreen(
+    authViewModel: com.techrifter.roundtableai.auth.AuthViewModel,
+    modifier: Modifier = Modifier,
+) {
+    val application = LocalContext.current.applicationContext as android.app.Application
+    val viewModel: InterviewViewModel = viewModel(
+        factory = InterviewViewModel.Factory(application) { authViewModel.getIdToken() }
+    )
     val uiState by viewModel.uiState.collectAsState()
     val agentState by viewModel.agentState.collectAsState()
     val transcript by viewModel.transcript.collectAsState()
@@ -348,6 +364,171 @@ fun InterviewScreen(modifier: Modifier = Modifier, viewModel: InterviewViewModel
     val currentPersona by viewModel.currentPersona.collectAsState()
     val report by viewModel.report.collectAsState()
     val profileState by viewModel.profileState.collectAsState()
+    val userLimits by viewModel.userLimits.collectAsState()
+    val isRefreshingLimits by viewModel.isRefreshingLimits.collectAsState()
+    val selectedMode by viewModel.selectedMode.collectAsState()
+    val selectedSkill by viewModel.selectedSkill.collectAsState()
+
+    var showUpgradeDialog by remember { mutableStateOf(false) }
+    var showAccountDialog by remember { mutableStateOf(false) }
+    var showDeleteAccountDialog by remember { mutableStateOf(false) }
+    var isDeletingAccount by remember { mutableStateOf(false) }
+    var deleteAccountError by remember { mutableStateOf<String?>(null) }
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    if (showUpgradeDialog) {
+        UpgradeProDialog(
+            hasJoinedWaitlist = userLimits?.hasJoinedWaitlist == true,
+            onDismiss = { showUpgradeDialog = false },
+            onJoinWaitlist = { viewModel.joinWaitlist() },
+        )
+    }
+    if (showAccountDialog) {
+        Dialog(onDismissRequest = { showAccountDialog = false }) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(24.dp))
+                    .background(Panel)
+                    .border(1.dp, SignatureA.copy(alpha = 0.4f), RoundedCornerShape(24.dp))
+                    .padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text("Account", color = Ink, fontFamily = Inter, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(20.dp))
+                Text(
+                    "Privacy policy",
+                    color = SignatureA,
+                    fontFamily = Inter,
+                    fontSize = 14.sp,
+                    modifier = Modifier.clickable {
+                        context.startActivity(
+                            Intent(
+                                Intent.ACTION_VIEW,
+                                Uri.parse("https://sites.google.com/view/roundtableai-privacy-policy"),
+                            )
+                        )
+                    },
+                )
+                Spacer(Modifier.height(18.dp))
+                Text(
+                    "Sign out",
+                    color = Ink,
+                    fontFamily = Inter,
+                    fontSize = 14.sp,
+                    modifier = Modifier.clickable {
+                        showAccountDialog = false
+                        authViewModel.signOut()
+                    },
+                )
+                Spacer(Modifier.height(18.dp))
+                Text(
+                    "Delete account",
+                    color = Danger,
+                    fontFamily = Inter,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.clickable {
+                        showAccountDialog = false
+                        deleteAccountError = null
+                        showDeleteAccountDialog = true
+                    },
+                )
+                Spacer(Modifier.height(20.dp))
+                Text(
+                    "Close",
+                    color = InkMuted,
+                    fontFamily = Inter,
+                    fontSize = 13.sp,
+                    modifier = Modifier.clickable { showAccountDialog = false },
+                )
+            }
+        }
+    }
+    if (showDeleteAccountDialog) {
+        Dialog(
+            onDismissRequest = {
+                if (!isDeletingAccount) showDeleteAccountDialog = false
+            }
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(24.dp))
+                    .background(Panel)
+                    .border(1.dp, Danger.copy(alpha = 0.4f), RoundedCornerShape(24.dp))
+                    .padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text(
+                    "Request account deletion?",
+                    color = Ink,
+                    fontFamily = Inter,
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center,
+                )
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    "Your request will be queued. Your account and associated data will be deleted within 48 hours. You will be signed out after the request is submitted.",
+                    color = InkMuted,
+                    fontFamily = Inter,
+                    fontSize = 13.sp,
+                    lineHeight = 19.sp,
+                    textAlign = TextAlign.Center,
+                )
+                deleteAccountError?.let { message ->
+                    Spacer(Modifier.height(12.dp))
+                    Text(message, color = Danger, fontFamily = Inter, fontSize = 12.sp, textAlign = TextAlign.Center)
+                }
+                Spacer(Modifier.height(22.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "Cancel",
+                        color = InkMuted,
+                        fontFamily = Inter,
+                        fontSize = 14.sp,
+                        modifier = Modifier.weight(1f).clickable(enabled = !isDeletingAccount) {
+                            showDeleteAccountDialog = false
+                        }.padding(vertical = 12.dp),
+                        textAlign = TextAlign.Center,
+                    )
+                    Text(
+                        if (isDeletingAccount) "Submitting…" else "Request deletion",
+                        color = Danger,
+                        fontFamily = Inter,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.weight(1f).clickable(enabled = !isDeletingAccount) {
+                            scope.launch {
+                                isDeletingAccount = true
+                                deleteAccountError = null
+                                val result = authViewModel.deleteAccount()
+                                isDeletingAccount = false
+                                result.onSuccess {
+                                    showDeleteAccountDialog = false
+                                    android.widget.Toast.makeText(
+                                        context,
+                                        "Deletion requested. Your account and associated data will be deleted.",
+                                        android.widget.Toast.LENGTH_LONG,
+                                    ).show()
+                                    authViewModel.signOut()
+                                }.onFailure {
+                                    deleteAccountError = it.message ?: "Could not submit the deletion request. Please try again."
+                                }
+                            }
+                        }.padding(vertical = 12.dp),
+                        textAlign = TextAlign.Center,
+                    )
+                }
+            }
+        }
+    }
 
     Box(
         modifier = modifier
@@ -363,18 +544,43 @@ fun InterviewScreen(modifier: Modifier = Modifier, viewModel: InterviewViewModel
                 localLevel = localLevel,
                 agentLevel = agentLevel,
                 persona = currentPersona,
+                selectedMode = selectedMode,
+                selectedSkill = selectedSkill,
                 onEnd = { viewModel.endInterview() },
             )
             InterviewStatus.REPORT -> ReportContent(
                 reportState = report,
+                selectedSkill = selectedSkill,
                 onRestart = { viewModel.startNewInterview() },
+                onRetryDrill = { skill -> viewModel.retryCurrentDrill(skill) },
             )
             else -> PreJoinContent(
                 uiState = uiState,
                 profileState = profileState,
+                userLimits = userLimits,
+                selectedMode = selectedMode,
+                selectedSkill = selectedSkill,
+                onSelectMode = { viewModel.selectMode(it) },
+                onSelectSkill = { viewModel.selectSkill(it) },
+                onRefreshLimits = { viewModel.refreshUserLimits() },
+                isRefreshingLimits = isRefreshingLimits,
+                onUpgradeClick = { showUpgradeDialog = true },
                 onAnalyze = { jd, resume -> viewModel.analyzeProfile(jd, resume) },
                 onChangeDocuments = { viewModel.resetProfile() },
                 onStart = { viewModel.startInterview() },
+            )
+        }
+        if (uiState.status != InterviewStatus.LIVE) {
+            Text(
+                text = "Account",
+                color = InkMuted,
+                fontFamily = Inter,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .clickable { showAccountDialog = true }
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
             )
         }
     }
@@ -389,6 +595,14 @@ private val DocumentMimeTypes = arrayOf(
 private fun PreJoinContent(
     uiState: InterviewUiState,
     profileState: ProfileUiState,
+    userLimits: UserLimits?,
+    selectedMode: InterviewMode,
+    selectedSkill: String?,
+    onSelectMode: (InterviewMode) -> Unit,
+    onSelectSkill: (String) -> Unit,
+    onRefreshLimits: () -> Unit,
+    isRefreshingLimits: Boolean,
+    onUpgradeClick: () -> Unit,
     onAnalyze: (Uri?, Uri?) -> Unit,
     onChangeDocuments: () -> Unit,
     onStart: () -> Unit,
@@ -398,11 +612,13 @@ private fun PreJoinContent(
     var jdUri by remember { mutableStateOf<Uri?>(null) }
     var resumeUri by remember { mutableStateOf<Uri?>(null) }
 
+    // Request RECORD_AUDIO + BLUETOOTH_CONNECT (API 31+ only) together in one dialog.
+    // BLUETOOTH_CONNECT denial is non-fatal: audio falls back to earpiece/speaker.
     val permissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        hasMicPermission = granted
-        if (granted) onStart()
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { grants ->
+        hasMicPermission = grants[Manifest.permission.RECORD_AUDIO] == true
+        if (hasMicPermission) onStart()
     }
 
     LaunchedEffect(Unit) {
@@ -420,12 +636,51 @@ private fun PreJoinContent(
 
     val isBusy = uiState.status == InterviewStatus.REQUESTING_SESSION || uiState.status == InterviewStatus.JOINING
 
-    Column(modifier = Modifier.fillMaxSize().padding(horizontal = 32.dp, vertical = 32.dp)) {
+    Column(modifier = Modifier.fillMaxSize().padding(horizontal = 32.dp, vertical = 28.dp)) {
         Column(
             modifier = Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.Center,
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
+            // Plan / Limit Status Pill
+            val isLimitReached = userLimits?.canStart == false
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(if (isLimitReached) Danger.copy(alpha = 0.15f) else SignatureDim)
+                    .border(
+                        1.dp,
+                        if (isLimitReached) Danger.copy(alpha = 0.45f) else SignatureA.copy(alpha = 0.35f),
+                        RoundedCornerShape(20.dp),
+                    )
+                    .clickable(enabled = userLimits != null || !isRefreshingLimits) {
+                        if (userLimits == null) onRefreshLimits() else onUpgradeClick()
+                    }
+                    .padding(horizontal = 14.dp, vertical = 7.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = when {
+                        userLimits == null && isRefreshingLimits -> "Checking limit status…"
+                        userLimits == null -> "Limit status unavailable • Tap to retry"
+                        userLimits.hasJoinedWaitlist && isLimitReached ->
+                            "Daily limit reached (0/${userLimits.dailyLimit}) • Priority Waitlist"
+                        userLimits.hasJoinedWaitlist ->
+                            "Daily limit: ${userLimits.remaining}/${userLimits.dailyLimit} • Priority Waitlist"
+                        isLimitReached -> "Daily limit reached (0/${userLimits.dailyLimit}) • Upgrade"
+                        else ->
+                            "Daily limit: ${userLimits.remaining}/${userLimits.dailyLimit} • Upgrade"
+                    },
+                    color = if (isLimitReached) Danger else Ink,
+                    fontFamily = Inter,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    letterSpacing = 0.3.sp,
+                )
+            }
+
+            Spacer(Modifier.height(18.dp))
+
             Text(
                 text = "LIVE VOICE INTERVIEW PANEL",
                 color = Signature,
@@ -434,27 +689,45 @@ private fun PreJoinContent(
                 fontWeight = FontWeight.SemiBold,
                 letterSpacing = 2.4.sp,
             )
-            Spacer(Modifier.height(24.dp))
-            VoicePresence(agentState = AgentState.IDLE, audioLevel = 0f, modifier = Modifier.size(180.dp))
-            Spacer(Modifier.height(32.dp))
+            Spacer(Modifier.height(20.dp))
+            VoicePresence(agentState = AgentState.IDLE, audioLevel = 0f, modifier = Modifier.size(170.dp))
+            Spacer(Modifier.height(28.dp))
             Text(
                 text = "Roundtable AI",
                 color = Ink,
-                fontSize = 38.sp,
+                fontSize = 36.sp,
                 fontFamily = Inter,
                 fontWeight = FontWeight.ExtraBold,
                 letterSpacing = (-1.2).sp,
             )
-            Spacer(Modifier.height(28.dp))
+            Spacer(Modifier.height(24.dp))
 
             if (profileState.status == ProfileStatus.READY && profileState.profile != null) {
                 ProfileReadySection(
                     profile = profileState.profile,
+                    selectedMode = selectedMode,
+                    selectedSkill = selectedSkill,
+                    onSelectMode = onSelectMode,
+                    onSelectSkill = onSelectSkill,
                     isBusy = isBusy,
                     errorMessage = uiState.errorMessage,
+                    userLimits = userLimits,
+                    onUpgradeClick = onUpgradeClick,
                     onChangeDocuments = onChangeDocuments,
                     onStart = {
-                        if (hasMicPermission) onStart() else permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                        if (userLimits?.canStart == false) {
+                            onUpgradeClick()
+                        } else if (hasMicPermission) {
+                            onStart()
+                        } else {
+                            val perms = buildList {
+                                add(Manifest.permission.RECORD_AUDIO)
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                                    add(Manifest.permission.BLUETOOTH_CONNECT)
+                                }
+                            }
+                            permissionLauncher.launch(perms.toTypedArray())
+                        }
                     },
                 )
             } else {
@@ -462,23 +735,14 @@ private fun PreJoinContent(
                     profileState = profileState,
                     jdName = jdUri?.let { resolveDisplayName(context, it) },
                     resumeName = resumeUri?.let { resolveDisplayName(context, it) },
+                    userLimits = userLimits,
+                    onUpgradeClick = onUpgradeClick,
                     onPickJd = { jdPicker.launch(DocumentMimeTypes) },
                     onPickResume = { resumePicker.launch(DocumentMimeTypes) },
                     onAnalyze = { onAnalyze(jdUri, resumeUri) },
                 )
             }
         }
-
-        // Sits below the scroll area rather than overlaying it.
-        Spacer(Modifier.height(16.dp))
-        Text(
-            text = "Powered by Agora Conversational AI",
-            color = InkFaint,
-            fontFamily = Inter,
-            fontSize = 12.sp,
-            letterSpacing = 0.3.sp,
-            modifier = Modifier.align(Alignment.CenterHorizontally),
-        )
     }
 }
 
@@ -487,11 +751,14 @@ private fun DocumentSetupSection(
     profileState: ProfileUiState,
     jdName: String?,
     resumeName: String?,
+    userLimits: UserLimits?,
+    onUpgradeClick: () -> Unit,
     onPickJd: () -> Unit,
     onPickResume: () -> Unit,
     onAnalyze: () -> Unit,
 ) {
     val isUploading = profileState.status == ProfileStatus.UPLOADING
+    val isLimitReached = userLimits?.canStart == false
     val canAnalyze = (jdName != null || resumeName != null) && !isUploading
 
     Text(
@@ -508,7 +775,17 @@ private fun DocumentSetupSection(
     Spacer(Modifier.height(12.dp))
     DocumentPickerRow(label = "Your resume", fileName = resumeName, enabled = !isUploading, onPick = onPickResume)
 
-    if (profileState.status == ProfileStatus.FAILED) {
+    if (isLimitReached) {
+        Spacer(Modifier.height(16.dp))
+        Text(
+            text = "Upgrade to Pro for unlimited practice →",
+            color = SignatureA,
+            fontFamily = Inter,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.clickable { onUpgradeClick() }
+        )
+    } else if (profileState.status == ProfileStatus.FAILED) {
         Spacer(Modifier.height(16.dp))
         Text(
             text = profileState.errorMessage ?: "Couldn't read that JD/resume.",
@@ -521,9 +798,9 @@ private fun DocumentSetupSection(
 
     Spacer(Modifier.height(28.dp))
     PrimaryButton(
-        label = if (isUploading) "Reading documents…" else "Analyze documents",
-        enabled = canAnalyze,
-        onClick = onAnalyze,
+        label = if (isLimitReached) "Upgrade to Pro" else if (isUploading) "Reading documents…" else "Analyze documents",
+        enabled = if (isLimitReached) true else canAnalyze,
+        onClick = if (isLimitReached) onUpgradeClick else onAnalyze,
     )
 }
 
@@ -562,11 +839,19 @@ private fun DocumentPickerRow(label: String, fileName: String?, enabled: Boolean
 @Composable
 private fun ProfileReadySection(
     profile: InterviewProfilePreview,
+    selectedMode: InterviewMode,
+    selectedSkill: String?,
+    onSelectMode: (InterviewMode) -> Unit,
+    onSelectSkill: (String) -> Unit,
     isBusy: Boolean,
     errorMessage: String?,
+    userLimits: UserLimits?,
+    onUpgradeClick: () -> Unit,
     onChangeDocuments: () -> Unit,
     onStart: () -> Unit,
 ) {
+    val isLimitReached = userLimits?.canStart == false && !isBusy
+
     Text(
         text = "READY TO INTERVIEW FOR",
         color = InkFaint,
@@ -584,19 +869,94 @@ private fun ProfileReadySection(
         fontWeight = FontWeight.Bold,
         textAlign = TextAlign.Center,
     )
-    if (profile.skills.isNotEmpty()) {
-        Spacer(Modifier.height(14.dp))
-        SkillChipsRow(skills = profile.skills.take(6))
+    Spacer(Modifier.height(20.dp))
+
+    Text(
+        text = "CHOOSE INTERVIEW MODE",
+        color = InkFaint,
+        fontFamily = Inter,
+        fontSize = 11.sp,
+        fontWeight = FontWeight.SemiBold,
+        letterSpacing = 1.2.sp,
+        modifier = Modifier.fillMaxWidth(),
+    )
+    Spacer(Modifier.height(10.dp))
+
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        // Option 1: Focused Practice
+        ModeOptionCard(
+            title = "Focused Practice",
+            duration = "5–15 min",
+            badgeText = "⚡ POPULAR",
+            badgeColor = SignatureB,
+            description = "Pick one skill, practise targeted questions, and receive instant coaching feedback with rapid retries.",
+            isSelected = selectedMode == InterviewMode.FOCUSED,
+            onClick = { onSelectMode(InterviewMode.FOCUSED) },
+        ) {
+            if (profile.skills.isNotEmpty()) {
+                Text(
+                    text = "SELECT TARGET SKILL",
+                    color = InkFaint,
+                    fontFamily = Inter,
+                    fontSize = 10.5.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    letterSpacing = 1.sp,
+                    modifier = Modifier.padding(start = 28.dp, bottom = 6.dp),
+                )
+                Box(modifier = Modifier.padding(start = 28.dp)) {
+                    SelectableSkillChipsRow(
+                        skills = profile.skills.take(8),
+                        selectedSkill = selectedSkill,
+                        onSelectSkill = onSelectSkill,
+                    )
+                }
+            }
+        }
+
+        // Option 2: Full Interview Simulation
+        ModeOptionCard(
+            title = "Full Simulation",
+            duration = "30–40 min",
+            badgeText = "🧭 STANDARD",
+            badgeColor = SignatureA,
+            description = "Three interviewers, multi-stage adaptive questioning, and a comprehensive rubric evaluation.",
+            isSelected = selectedMode == InterviewMode.FULL,
+            onClick = { onSelectMode(InterviewMode.FULL) },
+        ) {
+            if (profile.skills.isNotEmpty()) {
+                Box(modifier = Modifier.padding(start = 28.dp)) {
+                    SkillChipsRow(skills = profile.skills.take(5))
+                }
+            }
+        }
     }
-    errorMessage?.let {
+
+    if (errorMessage != null && !isBusy) {
         Spacer(Modifier.height(16.dp))
-        Text(text = it, color = Danger, fontFamily = Inter, fontSize = 13.sp, textAlign = TextAlign.Center)
+        Text(text = errorMessage, color = Danger, fontFamily = Inter, fontSize = 13.sp, textAlign = TextAlign.Center)
+    } else if (isLimitReached) {
+        Spacer(Modifier.height(16.dp))
+        Text(
+            text = "Upgrade to Pro for unlimited practice →",
+            color = SignatureA,
+            fontFamily = Inter,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.clickable { onUpgradeClick() }
+        )
     }
-    Spacer(Modifier.height(32.dp))
+
+    Spacer(Modifier.height(26.dp))
+    val buttonLabel = when {
+        isBusy -> "Connecting…"
+        isLimitReached -> "Upgrade to Pro"
+        selectedMode == InterviewMode.FOCUSED -> "Begin Focused Practice"
+        else -> "Begin Full Interview"
+    }
     PrimaryButton(
-        label = if (isBusy) "Connecting…" else "Begin session",
+        label = buttonLabel,
         enabled = !isBusy,
-        onClick = onStart,
+        onClick = if (isLimitReached) onUpgradeClick else onStart,
     )
     Spacer(Modifier.height(14.dp))
     Text(
@@ -612,6 +972,157 @@ private fun ProfileReadySection(
             onClick = onChangeDocuments,
         ),
     )
+}
+
+@Composable
+private fun ModeOptionCard(
+    title: String,
+    duration: String,
+    badgeText: String,
+    badgeColor: Color,
+    description: String,
+    isSelected: Boolean,
+    onClick: () -> Unit,
+    content: @Composable (() -> Unit)? = null,
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(18.dp))
+            .background(if (isSelected) Panel else Panel.copy(alpha = 0.5f))
+            .border(
+                width = if (isSelected) 1.5.dp else 1.dp,
+                brush = if (isSelected) Brush.horizontalGradient(listOf(SignatureA, SignatureB))
+                else Brush.linearGradient(listOf(SignatureDim, SignatureDim)),
+                shape = RoundedCornerShape(18.dp),
+            )
+            .clickable(
+                indication = null,
+                interactionSource = remember { MutableInteractionSource() },
+                onClick = onClick,
+            )
+            .padding(14.dp),
+    ) {
+        Column {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier
+                            .size(18.dp)
+                            .clip(CircleShape)
+                            .border(1.5.dp, if (isSelected) SignatureB else InkFaint.copy(alpha = 0.4f), CircleShape)
+                            .padding(3.dp),
+                    ) {
+                        if (isSelected) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .clip(CircleShape)
+                                    .background(Brush.horizontalGradient(listOf(SignatureA, SignatureB))),
+                            )
+                        }
+                    }
+                    Spacer(Modifier.width(10.dp))
+                    Text(
+                        text = title,
+                        color = Ink,
+                        fontFamily = Inter,
+                        fontSize = 14.5.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = duration,
+                        color = InkFaint,
+                        fontFamily = Inter,
+                        fontSize = 11.5.sp,
+                        fontWeight = FontWeight.Medium,
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(badgeColor.copy(alpha = 0.15f))
+                            .border(1.dp, badgeColor.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
+                            .padding(horizontal = 7.dp, vertical = 2.dp),
+                    ) {
+                        Text(
+                            text = badgeText,
+                            color = badgeColor,
+                            fontFamily = Inter,
+                            fontSize = 9.5.sp,
+                            fontWeight = FontWeight.Bold,
+                            letterSpacing = 0.6.sp,
+                        )
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(5.dp))
+            Text(
+                text = description,
+                color = InkMuted,
+                fontFamily = Inter,
+                fontSize = 12.sp,
+                lineHeight = 16.5.sp,
+                modifier = Modifier.padding(start = 28.dp),
+            )
+
+            if (content != null) {
+                Spacer(Modifier.height(10.dp))
+                content()
+            }
+        }
+    }
+}
+
+@Composable
+private fun SelectableSkillChipsRow(
+    skills: List<String>,
+    selectedSkill: String?,
+    onSelectSkill: (String) -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        skills.forEach { skill ->
+            val isSelected = skill == selectedSkill
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(if (isSelected) SignatureDim else Panel)
+                    .border(
+                        width = 1.dp,
+                        color = if (isSelected) SignatureA else SignatureDim,
+                        shape = RoundedCornerShape(12.dp),
+                    )
+                    .clickable { onSelectSkill(skill) }
+                    .padding(horizontal = 11.dp, vertical = 6.dp),
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (isSelected) {
+                        Text(text = "✓ ", color = SignatureA, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                    }
+                    Text(
+                        text = skill,
+                        color = if (isSelected) Ink else InkMuted,
+                        fontFamily = Inter,
+                        fontSize = 12.sp,
+                        fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
+                    )
+                }
+            }
+        }
+    }
 }
 
 @Composable
@@ -643,7 +1154,7 @@ private fun PrimaryButton(label: String, enabled: Boolean, onClick: () -> Unit) 
         contentAlignment = Alignment.Center,
         modifier = Modifier
             .height(56.dp)
-            .width(232.dp)
+            .widthIn(min = 232.dp, max = 290.dp)
             .clip(RoundedCornerShape(28.dp))
             .background(if (enabled) Ink else Ink.copy(alpha = 0.25f))
             .clickable(
@@ -651,9 +1162,10 @@ private fun PrimaryButton(label: String, enabled: Boolean, onClick: () -> Unit) 
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() },
                 onClick = onClick,
-            ),
+            )
+            .padding(horizontal = 24.dp),
     ) {
-        Text(text = label, color = Backdrop, fontFamily = Inter, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+        Text(text = label, color = Backdrop, fontFamily = Inter, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
     }
 }
 
@@ -665,6 +1177,8 @@ private fun LiveInterviewContent(
     localLevel: Float,
     agentLevel: Float,
     persona: String?,
+    selectedMode: InterviewMode = InterviewMode.FOCUSED,
+    selectedSkill: String? = null,
     onEnd: () -> Unit,
 ) {
     var elapsedSeconds by remember { mutableIntStateOf(0) }
@@ -708,7 +1222,29 @@ private fun LiveInterviewContent(
             }
         }
 
-        StageProgress(currentStage = persona, modifier = Modifier.fillMaxWidth().padding(top = 18.dp))
+        if (selectedMode == InterviewMode.FOCUSED) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 18.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(Panel)
+                    .border(1.dp, SignatureA.copy(alpha = 0.35f), RoundedCornerShape(12.dp))
+                    .padding(horizontal = 14.dp, vertical = 7.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = "FOCUSED PRACTICE • ${(selectedSkill ?: "TARGET SKILL").uppercase()}",
+                    color = SignatureB,
+                    fontFamily = Inter,
+                    fontSize = 11.5.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    letterSpacing = 1.2.sp,
+                )
+            }
+        } else {
+            StageProgress(currentStage = persona, modifier = Modifier.fillMaxWidth().padding(top = 18.dp))
+        }
 
         Column(
             modifier = Modifier.fillMaxWidth().padding(top = 20.dp),
@@ -841,10 +1377,21 @@ private fun SpeakerLabel(speaker: Speaker) {
 }
 
 @Composable
-private fun ReportContent(reportState: ReportUiState, onRestart: () -> Unit) {
+private fun ReportContent(
+    reportState: ReportUiState,
+    selectedSkill: String?,
+    onRestart: () -> Unit,
+    onRetryDrill: (String?) -> Unit,
+) {
     when (reportState.status) {
-        "ready" -> reportState.report?.let { ReportReadyContent(report = it, onRestart = onRestart) }
-            ?: ReportFailedContent(onRestart = onRestart)
+        "ready" -> reportState.report?.let {
+            ReportReadyContent(
+                report = it,
+                selectedSkill = selectedSkill,
+                onRestart = onRestart,
+                onRetryDrill = onRetryDrill,
+            )
+        } ?: ReportFailedContent(onRestart = onRestart)
         "failed" -> ReportFailedContent(onRestart = onRestart)
         "not_applicable" -> ReportEndedEarlyContent(onRestart = onRestart)
         else -> ReportPendingContent()
@@ -945,7 +1492,15 @@ private fun ReportFailedContent(onRestart: () -> Unit) {
  * scores, and the strengths / areas to improve with evidence from the conversation.
  */
 @Composable
-private fun ReportReadyContent(report: InterviewReport, onRestart: () -> Unit) {
+private fun ReportReadyContent(
+    report: InterviewReport,
+    selectedSkill: String?,
+    onRestart: () -> Unit,
+    onRetryDrill: (String?) -> Unit,
+) {
+    val isFocused = report.mode == "focused"
+    val drillSkill = report.targetSkill ?: selectedSkill
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -954,13 +1509,24 @@ private fun ReportReadyContent(report: InterviewReport, onRestart: () -> Unit) {
             .padding(top = 28.dp, bottom = 36.dp),
     ) {
         Text(
-            text = "YOUR PANEL FEEDBACK",
+            text = if (isFocused) "FOCUSED DRILL FEEDBACK" else "YOUR PANEL FEEDBACK",
             color = Signature,
             fontFamily = Inter,
             fontSize = 12.sp,
             fontWeight = FontWeight.SemiBold,
             letterSpacing = 2.2.sp,
         )
+        if (isFocused && !drillSkill.isNullOrBlank()) {
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = "TARGET SKILL: ${drillSkill.uppercase()}",
+                color = SignatureB,
+                fontFamily = Inter,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 1.2.sp,
+            )
+        }
         Spacer(Modifier.height(18.dp))
 
         Row(verticalAlignment = Alignment.Bottom) {
@@ -984,21 +1550,44 @@ private fun ReportReadyContent(report: InterviewReport, onRestart: () -> Unit) {
         Text(text = report.summary, color = InkMuted, fontFamily = Inter, fontSize = 15.sp, lineHeight = 22.sp)
 
         Spacer(Modifier.height(32.dp))
-        ScoreRow("Technical", report.technical)
-        Spacer(Modifier.height(14.dp))
-        ScoreRow("System Design", report.systemDesign)
-        Spacer(Modifier.height(14.dp))
-        ScoreRow("Behavioral", report.behavioral)
-        Spacer(Modifier.height(14.dp))
-        ScoreRow("Communication", report.communication)
+        if (isFocused) {
+            ScoreRow(drillSkill ?: "Skill Accuracy", report.technical)
+            Spacer(Modifier.height(14.dp))
+            ScoreRow("Communication & Clarity", report.communication)
+        } else {
+            ScoreRow("Technical", report.technical)
+            Spacer(Modifier.height(14.dp))
+            ScoreRow("System Design", report.systemDesign)
+            Spacer(Modifier.height(14.dp))
+            ScoreRow("Behavioral", report.behavioral)
+            Spacer(Modifier.height(14.dp))
+            ScoreRow("Communication", report.communication)
+        }
 
         Spacer(Modifier.height(36.dp))
         EvidenceSection(title = "Strengths", points = report.strengths, accent = SignatureA)
         Spacer(Modifier.height(28.dp))
-        EvidenceSection(title = "Areas to improve", points = report.improvements, accent = SignatureB)
+        EvidenceSection(title = if (isFocused) "Targeted Drill Takeaways" else "Areas to improve", points = report.improvements, accent = SignatureB)
 
         Spacer(Modifier.height(40.dp))
-        PrimaryButton(label = "Start new interview", enabled = true, onClick = onRestart)
+        if (isFocused) {
+            PrimaryButton(
+                label = "Retry this drill",
+                enabled = true,
+                onClick = { onRetryDrill(drillSkill) },
+            )
+            Spacer(Modifier.height(14.dp))
+            Text(
+                text = "Practice another skill or full interview",
+                color = InkFaint,
+                fontFamily = Inter,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Medium,
+                modifier = Modifier.clickable { onRestart() },
+            )
+        } else {
+            PrimaryButton(label = "Start new interview", enabled = true, onClick = onRestart)
+        }
     }
 }
 
@@ -1078,4 +1667,157 @@ private fun formatElapsed(totalSeconds: Int): String {
     val minutes = totalSeconds / 60
     val seconds = totalSeconds % 60
     return "%02d:%02d".format(minutes, seconds)
+}
+
+@Composable
+private fun UpgradeProDialog(
+    hasJoinedWaitlist: Boolean = false,
+    onDismiss: () -> Unit,
+    onJoinWaitlist: suspend () -> Boolean,
+) {
+    var joinedWaitlist by remember(hasJoinedWaitlist) { mutableStateOf(hasJoinedWaitlist) }
+    var isSubmitting by remember { mutableStateOf(false) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+
+    Dialog(onDismissRequest = onDismiss) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(24.dp))
+                .background(Panel)
+                .border(1.dp, SignatureA.copy(alpha = 0.4f), RoundedCornerShape(24.dp))
+                .padding(24.dp)
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(Brush.horizontalGradient(listOf(SignatureA, SignatureB)))
+                        .padding(horizontal = 14.dp, vertical = 6.dp)
+                ) {
+                    Text(
+                        text = "ROUNDTABLE PRO",
+                        color = Ink,
+                        fontFamily = Inter,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = 1.6.sp
+                    )
+                }
+                Spacer(Modifier.height(16.dp))
+                Text(
+                    text = "Daily Practice Limit",
+                    color = Ink,
+                    fontFamily = Inter,
+                    fontSize = 22.sp,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    text = "Free accounts get 2 interviews in a rolling 24-hour window. Upgrade to Pro for unlimited simulations, targeted skill drills, and advanced panel customization.",
+                    color = InkMuted,
+                    fontFamily = Inter,
+                    fontSize = 13.5.sp,
+                    lineHeight = 19.sp,
+                    textAlign = TextAlign.Center
+                )
+                Spacer(Modifier.height(20.dp))
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(Backdrop)
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    ProFeatureRow("⚡", "Unlimited AI voice interviews daily")
+                    ProFeatureRow("🎯", "In-depth turn analysis & rubric feedback")
+                    ProFeatureRow("🏢", "Custom FAANG & startup panel difficulty")
+                    ProFeatureRow("🔄", "Targeted technical & system design practice")
+                }
+                Spacer(Modifier.height(24.dp))
+                if (joinedWaitlist) {
+                    Text(
+                        text = "🎉 You're on the priority waitlist! We'll notify you as soon as Pro billing is available.",
+                        color = SignatureB,
+                        fontFamily = Inter,
+                        fontSize = 13.sp,
+                        textAlign = TextAlign.Center,
+                        fontWeight = FontWeight.Medium,
+                    )
+                } else {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .clip(RoundedCornerShape(24.dp))
+                            .background(
+                                if (isSubmitting) Brush.horizontalGradient(listOf(SignatureA.copy(alpha = 0.5f), SignatureB.copy(alpha = 0.5f)))
+                                else Brush.horizontalGradient(listOf(SignatureA, SignatureB))
+                            )
+                            .clickable(enabled = !isSubmitting) {
+                                scope.launch {
+                                    isSubmitting = true
+                                    errorMessage = null
+                                    val success = onJoinWaitlist()
+                                    isSubmitting = false
+                                    if (success) {
+                                        joinedWaitlist = true
+                                    } else {
+                                        errorMessage = "Couldn't reach server. Please check your connection."
+                                    }
+                                }
+                            },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (isSubmitting) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(22.dp),
+                                color = Ink,
+                                strokeWidth = 2.dp,
+                            )
+                        } else {
+                            Text(
+                                text = "Join Pro Waitlist (50% Off)",
+                                color = Ink,
+                                fontFamily = Inter,
+                                fontSize = 15.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                    }
+                }
+                if (errorMessage != null) {
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        text = errorMessage!!,
+                        color = Danger,
+                        fontFamily = Inter,
+                        fontSize = 12.5.sp,
+                        textAlign = TextAlign.Center,
+                    )
+                }
+                Spacer(Modifier.height(14.dp))
+                Text(
+                    text = if (joinedWaitlist) "Close" else "Maybe later",
+                    color = InkFaint,
+                    fontFamily = Inter,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium,
+                    modifier = Modifier.clickable { onDismiss() }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProFeatureRow(icon: String, text: String) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(text = icon, fontSize = 15.sp)
+        Spacer(Modifier.width(10.dp))
+        Text(text = text, color = Ink, fontFamily = Inter, fontSize = 13.sp, fontWeight = FontWeight.Normal)
+    }
 }

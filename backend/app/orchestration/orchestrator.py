@@ -213,14 +213,72 @@ def _advance_stage_machine(
     return StageState(stage, stage_start_turn, weak_topics, strong_topics, focus_topic, sorted(covered))
 
 
-def collect_interview_evidence(profile: InterviewProfile, messages: list[dict]) -> tuple[list[str], list[str]]:
-    """Weak/strong topics accumulated across the *whole* interview, for the final
-    report to cite as evidence. Reuses the stage machine's own bookkeeping (it
-    never resets weak_topics/strong_topics between stages, only topics_hit) rather
-    than a second analysis pass, so the report stays consistent with what actually
-    drove stage routing instead of judging the transcript from scratch.
+def resolve_focused_stage(target_skill: str | None, profile: InterviewProfile) -> InterviewStage:
+    """Maps a focused skill to the technical or system-design interviewer."""
+    if not target_skill:
+        return InterviewStage.TECHNICAL
+
+    target_lower = target_skill.lower().strip()
+
+    # Check system design topics or keywords
+    if any(topic.lower() in target_lower or target_lower in topic.lower() for topic in profile.system_design_topics):
+        return InterviewStage.SYSTEM_DESIGN
+    if any(kw in target_lower for kw in ["system design", "architecture", "distributed", "scalability", "caching", "database design", "microservices"]):
+        return InterviewStage.SYSTEM_DESIGN
+
+    return InterviewStage.TECHNICAL
+
+
+def _advance_focused_machine(
+    profile: InterviewProfile,
+    candidate_answers: list[str],
+    target_skill: str | None,
+    answer_times: list[float] | None = None,
+) -> StageState:
+    """State machine for a 5-15 minute single-skill Focused Practice drill.
+    Runs for 3-5 substantive turns on the chosen target skill, providing instant
+    coaching follow-ups before transitioning to FINAL_EVAL.
     """
-    state = _advance_stage_machine(profile, _candidate_answers(messages))
+    stage = resolve_focused_stage(target_skill, profile)
+    focus = target_skill or (_topic_pool_for(stage, profile)[0] if _topic_pool_for(stage, profile) else "General")
+
+    weak_topics: list[str] = []
+    strong_topics: list[str] = []
+    low_engagement_streak = 0
+
+    for answer in candidate_answers:
+        signal = analyze_answer(answer, [focus])
+        if signal.is_low_engagement:
+            low_engagement_streak += 1
+            weak_topics.append(focus)
+        else:
+            low_engagement_streak = 0
+            strong_topics.append(focus)
+
+    turns = len(candidate_answers)
+    times = answer_times or []
+    elapsed = (times[-1] - times[0]) if len(times) >= 2 else 0
+
+    # End drill when 5 questions are completed or 10 minutes elapsed
+    # or candidate disengaged repeatedly
+    if turns >= 5 or (turns >= 3 and elapsed >= 10 * 60) or low_engagement_streak >= 2:
+        return StageState(InterviewStage.FINAL_EVAL, 0, weak_topics, strong_topics, focus, [focus])
+
+    return StageState(stage, 0, weak_topics, strong_topics, focus, [focus])
+
+
+def collect_interview_evidence(
+    profile: InterviewProfile,
+    messages: list[dict],
+    mode: str = "full",
+    target_skill: str | None = None,
+) -> tuple[list[str], list[str]]:
+    """Weak/strong topics accumulated across the interview, for the final report to cite."""
+    answers = _candidate_answers(messages)
+    if mode == "focused":
+        state = _advance_focused_machine(profile, answers, target_skill)
+    else:
+        state = _advance_stage_machine(profile, answers)
     return state.weak_topics, state.strong_topics
 
 
@@ -251,7 +309,39 @@ def build_stage_system_prompt(
     profile: InterviewProfile,
     candidate_answers: list[str],
     answer_times: list[float] | None = None,
+    mode: str = "full",
+    target_skill: str | None = None,
 ) -> tuple[InterviewStage, str]:
+    if mode == "focused":
+        state = _advance_focused_machine(profile, candidate_answers, target_skill, answer_times)
+        if state.stage == InterviewStage.FINAL_EVAL:
+            skill_name = target_skill or "this skill"
+            return state.stage, (
+                f"The focused drill on {skill_name} is now complete. "
+                "Say this exact goodbye sentence, with no additional words: "
+                f'"That wraps up our focused practice drill on {skill_name}! Great practice—check your report for targeted feedback and takeaways."'
+            )
+
+        focus = state.focus_topic
+        strong = state.strong_topics
+
+        if state.stage == InterviewStage.SYSTEM_DESIGN:
+            base_prompt = build_system_design_persona_prompt(profile, [], strong, focus)
+        elif state.stage == InterviewStage.BEHAVIORAL:
+            base_prompt = build_behavioral_persona_prompt(profile, [], strong, focus)
+        else:
+            base_prompt = build_technical_persona_prompt(profile, [], strong, focus)
+
+        drill_directive = (
+            f"\n\n[FOCUSED PRACTICE DRILL ON: {focus}]\n"
+            "This is a high-yield, 5-to-15 minute Focused Practice session. "
+            f"Focus all questions directly on {focus}. "
+            "After the candidate answers, include a 1-sentence real-time spoken coaching reaction "
+            "(e.g. 'Good distinction on immutability' or 'Keep in mind edge cases around network timeouts') "
+            "and immediately ask your next question or a targeted follow-up. Keep the momentum high."
+        )
+        return state.stage, f"{base_prompt} {drill_directive}"
+
     state = _advance_stage_machine(profile, candidate_answers, answer_times)
     prior_notes = extract_prior_notes(candidate_answers, state.stage_start_turn)
 
@@ -269,6 +359,6 @@ def build_stage_system_prompt(
     if state.stage == InterviewStage.BEHAVIORAL:
         return state.stage, build_behavioral_persona_prompt(profile, prior_notes, strong, focus)
     return state.stage, (
-        "The interview is now over. Say goodbye to the candidate in one short, warm sentence. "
-        f'Say something close to: "{CLOSING_MESSAGE}"'
+        "The interview is now over. Say this exact closing sentence, with no additional words: "
+        f'"{CLOSING_MESSAGE}"'
     )
