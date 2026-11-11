@@ -47,9 +47,15 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
     val isGoogleSigningIn: StateFlow<Boolean> = _isGoogleSigningIn
 
     init {
-        // If a Firebase session is already persisted on this device, skip the sign-in screen.
+        // If a Firebase session is already persisted on this device, skip the sign-in screen
+        // once the user's email address is verified.
         val current = auth.currentUser
-        _authState.value = if (current != null) AuthState.SignedIn(current) else AuthState.SignedOut
+        if (current != null && current.isEmailVerified) {
+            _authState.value = AuthState.SignedIn(current)
+        } else {
+            if (current != null) auth.signOut()
+            _authState.value = AuthState.SignedOut
+        }
     }
 
     /**
@@ -80,11 +86,15 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
      */
     suspend fun getIdToken(): String? = try {
         auth.currentUser?.getIdToken(/* forceRefresh = */ false)?.await()?.token
+    } catch (e: CancellationException) {
+        throw e
     } catch (t: Throwable) {
         Log.e(TAG, "getIdToken failed — forcing refresh", t)
         // One retry with forceRefresh in case the cached token is corrupted.
         try {
             auth.currentUser?.getIdToken(/* forceRefresh = */ true)?.await()?.token
+        } catch (e2: CancellationException) {
+            throw e2
         } catch (t2: Throwable) {
             Log.e(TAG, "getIdToken forceRefresh also failed", t2)
             null
@@ -92,7 +102,7 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Signs in with email and password.
+     * Signs in with email and password. Unverified accounts are prompted to verify first.
      */
     fun signInWithEmail(email: String, password: String) {
         val cleanEmail = email.trim()
@@ -109,11 +119,24 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 val result = auth.signInWithEmailAndPassword(cleanEmail, password).await()
                 val user = result.user
-                if (user != null) {
+                if (user == null) {
+                    _authState.value = AuthState.Error("Sign-in succeeded but user is null")
+                } else if (user.isEmailVerified) {
                     _authState.value = AuthState.SignedIn(user)
                 } else {
-                    _authState.value = AuthState.Error("Sign-in succeeded but user is null")
+                    try {
+                        user.sendEmailVerification().await()
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Throwable) {
+                    }
+                    auth.signOut()
+                    _authState.value = AuthState.Error(
+                        "Please verify your email before signing in. Check $cleanEmail for the verification link."
+                    )
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (t: Throwable) {
                 Log.e(TAG, "signInWithEmail failed", t)
                 val msg = when {
@@ -132,7 +155,7 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Registers a new account with email and password.
+     * Registers a new account with email and password and sends a verification email.
      */
     fun signUpWithEmail(email: String, password: String) {
         val cleanEmail = email.trim()
@@ -158,10 +181,28 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
                 val result = auth.createUserWithEmailAndPassword(cleanEmail, password).await()
                 val user = result.user
                 if (user != null) {
-                    _authState.value = AuthState.SignedIn(user)
+                    val sent = try {
+                        user.sendEmailVerification().await()
+                        true
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "sendEmailVerification failed", t)
+                        false
+                    }
+                    auth.signOut()
+                    _authState.value = AuthState.Error(
+                        if (sent) {
+                            "Verification email sent to $cleanEmail. Verify your email, then sign in."
+                        } else {
+                            "Account created, but couldn't send verification email right now. Try signing in to resend."
+                        }
+                    )
                 } else {
                     _authState.value = AuthState.Error("Account creation succeeded but user is null")
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (t: Throwable) {
                 Log.e(TAG, "signUpWithEmail failed", t)
                 val msg = when {
@@ -181,6 +222,40 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
     fun clearError() {
         if (_authState.value is AuthState.Error) {
             _authState.value = AuthState.SignedOut
+        }
+    }
+
+    /**
+     * Sends a password reset email to the given address.
+     */
+    fun sendPasswordReset(email: String) {
+        val cleanEmail = email.trim()
+        if (cleanEmail.isEmpty()) {
+            _authState.value = AuthState.Error("Enter your email address above to reset your password.")
+            return
+        }
+        viewModelScope.launch {
+            _authState.value = AuthState.Loading
+            try {
+                auth.sendPasswordResetEmail(cleanEmail).await()
+                _authState.value = AuthState.Error(
+                    "Password reset link sent to $cleanEmail. Check your inbox to set a new password."
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                Log.e(TAG, "sendPasswordReset failed", t)
+                val msg = when {
+                    t.message?.contains("user-not-found", ignoreCase = true) == true ->
+                        "No account found with this email."
+                    t.message?.contains("invalid-email", ignoreCase = true) == true ->
+                        "Please enter a valid email address."
+                    t.message?.contains("too-many-requests", ignoreCase = true) == true ->
+                        "Too many requests. Please try again later."
+                    else -> t.localizedMessage ?: "Failed to send reset email. Please try again."
+                }
+                _authState.value = AuthState.Error(msg)
+            }
         }
     }
 

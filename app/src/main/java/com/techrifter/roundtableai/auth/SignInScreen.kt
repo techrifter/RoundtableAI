@@ -136,19 +136,22 @@ fun SignInScreen(
             )
             Spacer(Modifier.height(28.dp))
 
-            // Error display
+            // Status / Error display
             if (authState is AuthState.Error) {
+                val msg = (authState as AuthState.Error).message
+                val isInfo = msg.contains("sent", ignoreCase = true) || msg.contains("check", ignoreCase = true)
+                val tint = if (isInfo) SignatureA else Danger
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(12.dp))
-                        .background(Danger.copy(alpha = 0.12f))
-                        .border(1.dp, Danger.copy(alpha = 0.4f), RoundedCornerShape(12.dp))
+                        .background(tint.copy(alpha = 0.08f))
+                        .border(1.dp, tint.copy(alpha = 0.25f), RoundedCornerShape(12.dp))
                         .padding(horizontal = 16.dp, vertical = 12.dp),
                 ) {
                     Text(
-                        text = (authState as AuthState.Error).message,
-                        color = Danger,
+                        text = msg,
+                        color = if (isInfo) Ink else Color(0xFFFFB3BA),
                         fontSize = 12.5.sp,
                         lineHeight = 17.sp,
                         textAlign = TextAlign.Center,
@@ -242,7 +245,32 @@ fun SignInScreen(
                 modifier = Modifier.fillMaxWidth(),
             )
 
-            Spacer(Modifier.height(20.dp))
+            if (!isSignUp) {
+                Spacer(Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
+                ) {
+                    Text(
+                        text = "Forgot password?",
+                        color = InkMuted,
+                        fontFamily = Inter,
+                        fontSize = 12.5.sp,
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier.clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null,
+                            onClick = {
+                                focusManager.clearFocus()
+                                authViewModel.sendPasswordReset(email)
+                            }
+                        )
+                    )
+                }
+                Spacer(Modifier.height(14.dp))
+            } else {
+                Spacer(Modifier.height(20.dp))
+            }
 
             // Primary action button (Sign In / Sign Up)
             val isLoading = authState is AuthState.Loading
