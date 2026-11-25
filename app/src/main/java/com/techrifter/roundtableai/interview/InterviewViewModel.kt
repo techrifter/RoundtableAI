@@ -9,6 +9,7 @@ import androidx.lifecycle.viewModelScope
 import com.techrifter.roundtableai.network.InterviewProfilePreview
 import com.techrifter.roundtableai.network.InterviewReport
 import com.techrifter.roundtableai.network.SessionApi
+import com.techrifter.roundtableai.network.SettingsApi
 import com.techrifter.roundtableai.network.UserLimits
 import io.agora.conversational.api.AgentState
 import io.agora.conversational.api.ConversationalAIAPIConfig
@@ -119,12 +120,27 @@ class InterviewViewModel(
     private val _selectedSkill = MutableStateFlow<String?>(null)
     val selectedSkill: StateFlow<String?> = _selectedSkill
 
+    private val _accessMode = MutableStateFlow("ROUND_TABLE_MANAGED")
+    val accessMode: StateFlow<String> = _accessMode
+
+    private val _byokConnected = MutableStateFlow(false)
+    val byokConnected: StateFlow<Boolean> = _byokConnected
+
+    private val settingsApi = SettingsApi(tokenProvider)
+
     fun selectMode(mode: InterviewMode) {
         _selectedMode.value = mode
     }
 
     fun selectSkill(skill: String) {
         _selectedSkill.value = skill
+    }
+
+    fun selectAccessMode(mode: String) {
+        _accessMode.value = mode
+        if (_uiState.value.errorMessage != null) {
+            _uiState.value = _uiState.value.copy(errorMessage = null)
+        }
     }
 
     private var candidateUid: Int = 0
@@ -145,14 +161,27 @@ class InterviewViewModel(
         }
     }
 
-    fun refreshUserLimits() {
+    fun refreshUserLimits(clearError: Boolean = false) {
         val requestId = ++limitsRequestId
         _isRefreshingLimits.value = true
+        if (clearError) {
+            _uiState.value = _uiState.value.copy(errorMessage = null)
+        }
         viewModelScope.launch {
             try {
                 val limits = sessionApi.getUserLimits()
+                val status = try { settingsApi.getStatus().status } catch (e: Exception) { "Not configured" }
+                val isConnected = status == "Connected" || status == "Connected & Verified"
+
                 if (requestId == limitsRequestId) {
                     _userLimits.value = limits
+                    _byokConnected.value = isConnected
+                    if (isConnected) {
+                        _accessMode.value = "USER_BYOK"
+                    }
+                    if (clearError) {
+                        _uiState.value = InterviewUiState(status = InterviewStatus.IDLE, errorMessage = null)
+                    }
                 }
             } finally {
                 if (requestId == limitsRequestId) {
@@ -162,14 +191,7 @@ class InterviewViewModel(
         }
     }
 
-    suspend fun joinWaitlist(): Boolean {
-        val success = sessionApi.joinWaitlist()
-        if (success) {
-            _userLimits.value = _userLimits.value?.copy(hasJoinedWaitlist = true)
-            refreshUserLimits()
-        }
-        return success
-    }
+
 
     private val rtcEventHandler = object : IRtcEngineEventHandler() {
         override fun onJoinChannelSuccess(channel: String?, uid: Int, elapsed: Int) {
@@ -348,17 +370,24 @@ class InterviewViewModel(
 
         val mode = if (_selectedMode.value == InterviewMode.FOCUSED) "focused" else "full"
         val targetSkill = if (_selectedMode.value == InterviewMode.FOCUSED) _selectedSkill.value else null
+        val access = _accessMode.value
 
         viewModelScope.launch {
+            var activeChannel: String? = null
             try {
-                val session = sessionApi.startSession(profileId,     mode, targetSkill)
+                val session = sessionApi.startSession(profileId, mode, targetSkill, access)
+                activeChannel = session.channelName
                 _userLimits.value = _userLimits.value?.let { limits ->
-                    val used = limits.usedToday + 1
-                    limits.copy(
-                        usedToday = used,
-                        remaining = (limits.dailyLimit - used).coerceAtLeast(0),
-                        canStart = used < limits.dailyLimit,
-                    )
+                    if (access != "USER_BYOK") {
+                        val used = limits.used + 1
+                        limits.copy(
+                            used = used,
+                            remaining = (limits.limit - used).coerceAtLeast(0),
+                            available = used < limits.limit,
+                        )
+                    } else {
+                        limits
+                    }
                 }
                 refreshUserLimits()
                 _uiState.value = _uiState.value.copy(status = InterviewStatus.JOINING)
@@ -370,7 +399,12 @@ class InterviewViewModel(
                     rtmToken = session.rtmToken,
                 )
             } catch (t: Throwable) {
-                refreshUserLimits()
+                activeChannel?.let { ch ->
+                    launch {
+                        sessionApi.cancelSession(ch)
+                        refreshUserLimits(clearError = false)
+                    }
+                }
                 _uiState.value = InterviewUiState(
                     status = InterviewStatus.ERROR,
                     errorMessage = t.message ?: "Failed to start session",
@@ -415,6 +449,10 @@ class InterviewViewModel(
         val joinResult = engine.joinChannel(token, channelName, uid, options)
         if (joinResult != 0) {
             Log.e(TAG, "engine.joinChannel returned error: $joinResult")
+            viewModelScope.launch {
+                sessionApi.cancelSession(channelName)
+                refreshUserLimits(clearError = false)
+            }
             _uiState.value = InterviewUiState(
                 status = InterviewStatus.ERROR,
                 errorMessage = "Failed to connect to voice channel (error $joinResult)",
@@ -556,7 +594,7 @@ class InterviewViewModel(
         val TERMINAL_REPORT_STATUSES = setOf("ready", "failed", "not_applicable")
     }
 
-    /** Retries a focused practice drill on the targeted skill. */
+    /** Sets up a focused practice drill on the targeted skill and returns to the pre-join screen. */
     fun retryCurrentDrill(targetSkill: String? = null) {
         if (targetSkill != null) {
             _selectedSkill.value = targetSkill
@@ -565,7 +603,6 @@ class InterviewViewModel(
         _report.value = ReportUiState()
         _uiState.value = InterviewUiState(status = InterviewStatus.IDLE)
         refreshUserLimits()
-        startInterview()
     }
 
     /** Leaves the report screen and resets to the pre-join state for another run. */

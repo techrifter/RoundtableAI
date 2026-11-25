@@ -3,6 +3,7 @@ package com.techrifter.roundtableai.auth
 import android.app.Activity
 import android.content.Intent
 import android.net.Uri
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -87,6 +88,10 @@ fun SignInScreen(
     var email by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     var passwordVisible by remember { mutableStateOf(false) }
+
+    BackHandler(enabled = isSignUp) {
+        isSignUp = false
+    }
 
     Box(
         modifier = modifier

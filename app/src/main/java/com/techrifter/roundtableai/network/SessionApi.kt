@@ -104,11 +104,12 @@ data class InterviewProfilePreview(
 data class UploadResult(val profileId: String, val profile: InterviewProfilePreview)
 
 data class UserLimits(
-    val dailyLimit: Int = 2,
-    val usedToday: Int = 0,
+    val limit: Int = 2,
+    val used: Int = 0,
     val remaining: Int = 2,
-    val canStart: Boolean = true,
-    val hasJoinedWaitlist: Boolean = false,
+    val available: Boolean = true,
+    val period: String = "",
+    val resetsAt: String = "",
 )
 
 /** Resolves a content:// Uri's display name (e.g. "Resume.pdf") — the backend
@@ -167,7 +168,7 @@ class SessionApi(private val tokenProvider: suspend () -> String?) {
     suspend fun getUserLimits(): UserLimits? = withContext(Dispatchers.IO) {
         // The dashboard may request limits before the startup warm-up completes.
         withTimeoutOrNull(WARM_UP_WAIT_MS) { warmedUp.await() }
-        val request = authedRequest("$BACKEND_BASE_URL/session/limits").get().build()
+        val request = authedRequest("$BACKEND_BASE_URL/session/quota/status").get().build()
         repeat(LIMITS_REQUEST_ATTEMPTS) { attempt ->
             try {
                 client.newCall(request).execute().use { response ->
@@ -182,22 +183,24 @@ class SessionApi(private val tokenProvider: suspend () -> String?) {
                     } else {
                         val json = JSONObject(response.body?.string().orEmpty())
                         val requiredFields = listOf(
-                            "daily_limit",
-                            "used_today",
+                            "limit",
+                            "used",
                             "remaining",
-                            "can_start",
-                            "has_joined_waitlist",
+                            "available",
+                            "period",
+                            "resets_at",
                         )
                         if (requiredFields.any { !json.has(it) || json.isNull(it) }) {
                             android.util.Log.e("SessionApi", "Limits response is missing required fields")
                             return@withContext null
                         }
                         return@withContext UserLimits(
-                            dailyLimit = json.getInt("daily_limit"),
-                            usedToday = json.getInt("used_today"),
+                            limit = json.getInt("limit"),
+                            used = json.getInt("used"),
                             remaining = json.getInt("remaining"),
-                            canStart = json.getBoolean("can_start"),
-                            hasJoinedWaitlist = json.getBoolean("has_joined_waitlist"),
+                            available = json.getBoolean("available"),
+                            period = json.getString("period"),
+                            resetsAt = json.getString("resets_at"),
                         )
                     }
                 }
@@ -219,21 +222,7 @@ class SessionApi(private val tokenProvider: suspend () -> String?) {
         null
     }
 
-    /** Adds the candidate's verified account to the Pro early-access waitlist. */
-    suspend fun joinWaitlist(): Boolean = withContext(Dispatchers.IO) {
-        try {
-            val request = authedRequest("$BACKEND_BASE_URL/user/waitlist")
-                .post("{}".toRequestBody("application/json".toMediaType()))
-                .build()
-            client.newCall(request).execute().use { response ->
-                android.util.Log.d("SessionApi", "joinWaitlist HTTP code: ${response.code}")
-                response.isSuccessful
-            }
-        } catch (t: Throwable) {
-            android.util.Log.e("SessionApi", "joinWaitlist error: ${t.message}", t)
-            false
-        }
-    }
+
 
     /** Submits an authenticated account-deletion request to the backend queue. */
     suspend fun deleteAccount() = withContext(Dispatchers.IO) {
@@ -295,6 +284,7 @@ class SessionApi(private val tokenProvider: suspend () -> String?) {
         profileId: String,
         mode: String = "full",
         targetSkill: String? = null,
+        accessMode: String = "ROUND_TABLE_MANAGED"
     ): SessionInfo = withContext(Dispatchers.IO) {
         val payload = JSONObject().apply {
             put("profile_id", profileId)
@@ -302,6 +292,7 @@ class SessionApi(private val tokenProvider: suspend () -> String?) {
             if (!targetSkill.isNullOrBlank()) {
                 put("target_skill", targetSkill)
             }
+            put("access_mode", accessMode)
         }.toString()
         val request = authedRequest("$BACKEND_BASE_URL/session/start")
             .post(payload.toRequestBody("application/json".toMediaType()))
@@ -357,6 +348,19 @@ class SessionApi(private val tokenProvider: suspend () -> String?) {
             }
         } catch (t: Throwable) {
             null
+        }
+    }
+
+    /** Called when client RTC initialization or channel join fails, immediately
+     * refunding the reserved quota on the backend. */
+    suspend fun cancelSession(channelName: String): Unit = withContext(Dispatchers.IO) {
+        val request = authedRequest("$BACKEND_BASE_URL/session/$channelName/cancel")
+            .post("".toRequestBody("application/json".toMediaType()))
+            .build()
+        try {
+            client.newCall(request).execute().close()
+        } catch (_: Throwable) {
+            // Best effort
         }
     }
 
