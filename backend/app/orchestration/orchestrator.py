@@ -60,9 +60,8 @@ STAGE_PLANS: dict[InterviewStage, StagePlan] = {
 }
 
 # A weak answer ends the current topic immediately, but it takes this many in a row
-# to end the whole round early. Drilling something the candidate plainly doesn't
-# know wastes the round; one weak answer somewhere is just a gap, not a verdict.
-LOW_ENGAGEMENT_STREAK_TO_ADVANCE = 3
+# to end the whole round early once minimum turns are reached.
+LOW_ENGAGEMENT_STREAK_TO_ADVANCE = 5
 
 # Distinct MiniMax voice per persona so the panel sounds like different people.
 STAGE_VOICE_CONFIG = {
@@ -122,15 +121,17 @@ def _advance_stage_machine(
     """Replays the candidate's answers in order to compute the current stage and
     which topic the panel should be on.
 
-    Two levers per round. Depth: a strong answer on a topic earns follow-ups on that
-    same topic, up to the plan's topic_depth, then the round moves to the next topic
-    in the pool. A weak answer ends that topic immediately, since drilling something
-    the candidate doesn't know teaches nobody anything. Breadth: the round ends once
-    its time budget is spent, or the topic pool is exhausted past the minimum.
+    Enforces 4 independent termination and progression guardrails per round:
+    1. Maximum Round Duration: `out_of_time` advances the round once `max_seconds` is reached.
+    2. Maximum Turns: `out_of_turns` advances the round once `max_turns` is reached.
+    3. Minimum Round Completion: `past_minimum` requires meeting both `min_turns` and `min_seconds`
+       before pool exhaustion or low engagement can trigger an advance.
+    4. Consecutive Disengagement Threshold: `disengaged` terminates a round early only if
+       `low_engagement_streak >= LOW_ENGAGEMENT_STREAK_TO_ADVANCE` (5 consecutive thin/uncertain
+       answers) AND `past_minimum` requirements are satisfied.
 
-    `answer_times` is one wall-clock timestamp per answer. When absent (backend
-    restarted mid-interview, so the timestamps are gone) the turn bounds still hold
-    and the round runs to max_turns instead of a clock.
+    The engagement signal informs drill depth and early advancement, but never overrides or extends
+    the independent maximum hard caps (time or turns).
     """
     times = answer_times or []
 
@@ -190,8 +191,8 @@ def _advance_stage_machine(
         )
         nothing_left = focus_topic is None and not _next_topic(topic_pool, covered)
 
-        # Sustained silence ends the round regardless of its time budget.
-        disengaged = low_engagement_streak >= LOW_ENGAGEMENT_STREAK_TO_ADVANCE
+        # Sustained silence ends the round only after past_minimum turns are reached
+        disengaged = low_engagement_streak >= LOW_ENGAGEMENT_STREAK_TO_ADVANCE and past_minimum
 
         should_advance = out_of_time or out_of_turns or disengaged or (past_minimum and nothing_left)
 
@@ -229,15 +230,20 @@ def resolve_focused_stage(target_skill: str | None, profile: InterviewProfile) -
     return InterviewStage.TECHNICAL
 
 
+FOCUSED_MIN_SECONDS = 7 * 60       # 7 minutes minimum for disengagement early exit
+FOCUSED_STANDARD_SECONDS = 10 * 60 # 10 minutes standard target duration
+FOCUSED_MAX_SECONDS = 15 * 60      # 15 minutes absolute max time cap
+
+
 def _advance_focused_machine(
     profile: InterviewProfile,
     candidate_answers: list[str],
     target_skill: str | None,
     answer_times: list[float] | None = None,
 ) -> StageState:
-    """State machine for a 5-15 minute single-skill Focused Practice drill.
-    Runs for 3-5 substantive turns on the chosen target skill, providing instant
-    coaching follow-ups before transitioning to FINAL_EVAL.
+    """Time-driven state machine for Focused Practice drill.
+    Target duration: 7 to 10 minutes (max 15 minutes).
+    If candidate gives 5+ improper/disengaged answers, ends early between 7-10 minutes.
     """
     stage = resolve_focused_stage(target_skill, profile)
     focus = target_skill or (_topic_pool_for(stage, profile)[0] if _topic_pool_for(stage, profile) else "General")
@@ -245,11 +251,13 @@ def _advance_focused_machine(
     weak_topics: list[str] = []
     strong_topics: list[str] = []
     low_engagement_streak = 0
+    total_low_engagement = 0
 
     for answer in candidate_answers:
         signal = analyze_answer(answer, [focus])
         if signal.is_low_engagement:
             low_engagement_streak += 1
+            total_low_engagement += 1
             weak_topics.append(focus)
         else:
             low_engagement_streak = 0
@@ -259,9 +267,16 @@ def _advance_focused_machine(
     times = answer_times or []
     elapsed = (times[-1] - times[0]) if len(times) >= 2 else 0
 
-    # End drill when 5 questions are completed or 10 minutes elapsed
-    # or candidate disengaged repeatedly
-    if turns >= 5 or (turns >= 3 and elapsed >= 10 * 60) or low_engagement_streak >= 2:
+    # 1. Absolute max time limit reached (15 minutes)
+    if elapsed >= FOCUSED_MAX_SECONDS:
+        return StageState(InterviewStage.FINAL_EVAL, 0, weak_topics, strong_topics, focus, [focus])
+
+    # 2. Standard completion (10 minutes elapsed with at least 2 turns)
+    if turns >= 2 and elapsed >= FOCUSED_STANDARD_SECONDS:
+        return StageState(InterviewStage.FINAL_EVAL, 0, weak_topics, strong_topics, focus, [focus])
+
+    # 3. Early exit between 7 and 10 minutes if user gave 5+ improper/disengaged answers
+    if turns >= 2 and elapsed >= FOCUSED_MIN_SECONDS and (low_engagement_streak >= 5 or total_low_engagement >= 5):
         return StageState(InterviewStage.FINAL_EVAL, 0, weak_topics, strong_topics, focus, [focus])
 
     return StageState(stage, 0, weak_topics, strong_topics, focus, [focus])
@@ -334,11 +349,11 @@ def build_stage_system_prompt(
 
         drill_directive = (
             f"\n\n[FOCUSED PRACTICE DRILL ON: {focus}]\n"
-            "This is a high-yield, 5-to-15 minute Focused Practice session. "
+            "This is a high-yield Focused Practice session. "
             f"Focus all questions directly on {focus}. "
-            "After the candidate answers, include a 1-sentence real-time spoken coaching reaction "
-            "(e.g. 'Good distinction on immutability' or 'Keep in mind edge cases around network timeouts') "
-            "and immediately ask your next question or a targeted follow-up. Keep the momentum high."
+            "Actively ground your questions in the candidate's stated resume projects and hands-on experience whenever applicable. "
+            "Acknowledge or validate naturally when appropriate, and ask your next question or a targeted follow-up. "
+            "Keep responses concise (target 12-25 words, max 30 words) and keep the momentum high."
         )
         return state.stage, f"{base_prompt} {drill_directive}"
 

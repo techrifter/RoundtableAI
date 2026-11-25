@@ -114,13 +114,22 @@ async def upload_jd(
                 raise HTTPException(status_code=400, detail="The resume file must be under 5MB.")
             resume_text = extract_text_from_upload(resume_file.filename or "resume", resume_bytes)
 
-        profile = await extract_interview_profile(jd_text, resume_text)
+        user_groq_key = None
+        try:
+            from app.firestore_db import get_agora_credentials
+            creds = await get_agora_credentials(uid)
+            if creds and creds.get("groq_api_key"):
+                user_groq_key = creds["groq_api_key"]
+        except Exception:
+            pass
+
+        profile = await extract_interview_profile(jd_text, resume_text, groq_api_key=user_groq_key)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to parse JD/resume: {exc}") from exc
+        raise HTTPException(status_code=502, detail="Failed to parse document. Please try again.") from exc
 
     profile_id = secrets.token_hex(8)
     _profile_store[profile_id] = profile
