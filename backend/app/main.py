@@ -10,6 +10,7 @@ from app.api.legal import router as legal_router
 from app.api.llm import router as llm_router
 from app.api.session import router as session_router
 from app.api.user import router as user_router
+from app.api.settings import router as settings_router
 from app.auth import init_firebase
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s: %(message)s")
@@ -34,6 +35,7 @@ app.include_router(session_router)
 app.include_router(jd_router)
 app.include_router(user_router)
 app.include_router(legal_router)
+app.include_router(settings_router)
 
 # Health check endpoint for monitoring the backend's availability.
 # Intentionally unauthenticated — used by the Android app's warm-up ping.

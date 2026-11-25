@@ -15,14 +15,14 @@ from app.services.agora_access_token.rtm_token_builder import RtmTokenBuilder
 TOKEN_EXPIRY_SECONDS = 3600
 
 
-def build_rtc_token(channel_name: str, uid: int) -> str:
+def build_rtc_token(app_id: str, app_certificate: str, channel_name: str, uid: int) -> str:
     """The candidate's RTC token. Sent to the app, used for engine.joinChannel().
 
     Bound to this channel and this uid, so it is useless anywhere else. No video
     privilege — this is a voice product. PublishDataStream is a fallback only:
     transcripts currently arrive over RTM (agora_agent.py sets data_channel="rtm").
     """
-    token = AccessToken(settings.agora_app_id, settings.agora_app_certificate, expire=TOKEN_EXPIRY_SECONDS)
+    token = AccessToken(app_id, app_certificate, expire=TOKEN_EXPIRY_SECONDS)
 
     rtc_service = ServiceRtc(channel_name, uid)
     rtc_service.add_privilege(ServiceRtc.kPrivilegeJoinChannel, TOKEN_EXPIRY_SECONDS)
@@ -33,7 +33,7 @@ def build_rtc_token(channel_name: str, uid: int) -> str:
     return token.build()
 
 
-def build_agent_rtc_rtm_token(channel_name: str, uid: int, rtm_uid: str) -> str:
+def build_agent_rtc_rtm_token(app_id: str, app_certificate: str, channel_name: str, uid: int, rtm_uid: str) -> str:
     """The Conversational AI agent's token. Handed to Agora's REST API in the join
     payload's `token` field; it never goes to the client.
 
@@ -47,7 +47,7 @@ def build_agent_rtc_rtm_token(channel_name: str, uid: int, rtm_uid: str) -> str:
     there is no specific uid to bind to. It does mean this token is valid for any
     uid in the channel, which is why it must never be returned to a client.
     """
-    token = AccessToken(settings.agora_app_id, settings.agora_app_certificate, expire=TOKEN_EXPIRY_SECONDS)
+    token = AccessToken(app_id, app_certificate, expire=TOKEN_EXPIRY_SECONDS)
 
     rtc_service = ServiceRtc(channel_name, uid)
     rtc_service.add_privilege(ServiceRtc.kPrivilegeJoinChannel, TOKEN_EXPIRY_SECONDS)
@@ -62,7 +62,7 @@ def build_agent_rtc_rtm_token(channel_name: str, uid: int, rtm_uid: str) -> str:
     return token.build()
 
 
-def build_rtm_token(user_id: str) -> str:
+def build_rtm_token(app_id: str, app_certificate: str, user_id: str) -> str:
     """The candidate's RTM token, for receiving transcript and agent-state events.
     Sent to the app, used for rtm.login().
 
@@ -71,8 +71,8 @@ def build_rtm_token(user_id: str) -> str:
     the AccessToken2/007 format; the legacy 006 builders will not work.
     """
     return RtmTokenBuilder.build_token(
-        settings.agora_app_id,
-        settings.agora_app_certificate,
+        app_id,
+        app_certificate,
         user_id,
         TOKEN_EXPIRY_SECONDS,
     )

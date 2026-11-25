@@ -20,5 +20,8 @@ class Settings(BaseSettings):
     # Optional local service-account key. Production deployments should use ADC.
     firebase_service_account_path: str = ""
 
+    # 32-byte hex string used for AES-256-GCM encryption of BYOK credentials
+    credential_encryption_key: str = ""
+
 
 settings = Settings()

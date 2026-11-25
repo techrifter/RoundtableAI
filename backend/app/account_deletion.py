@@ -38,7 +38,26 @@ async def _delete_account_data(uid: str) -> None:
     for channel_name, stored_agent_id in channels_by_name.items():
         agent_id = stored_agent_id or agora_agent.get_agent_id(channel_name)
         if agent_id:
-            await agora_agent.stop_agent(agent_id)
+            from app.config import settings
+            from app.firestore_db import get_agora_credentials, get_db
+            
+            app_id = settings.agora_app_id
+            customer_id = settings.agora_customer_id
+            customer_secret = settings.agora_customer_secret
+
+            db = get_db()
+            if db:
+                doc = db.collection("sessions").document(channel_name).get()
+                if doc.exists:
+                    data = doc.to_dict() or {}
+                    if data.get("quota_type") == "BYOK":
+                        creds = await get_agora_credentials(uid)
+                        if creds:
+                            app_id = creds["app_id"]
+                            customer_id = creds["customer_id"]
+                            customer_secret = creds["customer_secret"]
+
+            await agora_agent.stop_agent(app_id, customer_id, customer_secret, agent_id)
 
     profile_ids, deleted_channels = await delete_user_data(uid)
     all_channels = set(channels_by_name) | set(deleted_channels)

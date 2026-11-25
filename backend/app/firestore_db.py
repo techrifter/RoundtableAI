@@ -2,13 +2,13 @@
 Firestore persistence layer for RoundtableAI.
 
 Manages persistent storage in Google Cloud Firestore for:
-1. 'waitlist': Early access Pro waitlist signups (doc ID = uid)
-2. 'users': Candidate metadata and daily rate-limiting session epochs (doc ID = uid)
+1. 'users': Candidate metadata and daily rate-limiting session epochs (doc ID = uid)
 3. 'profiles': Parsed JD and resume candidate profiles (doc ID = profile_id)
 4. 'sessions': Interview session lifecycle, stage tracking, transcripts, and evaluation reports (doc ID = channel_name)
 """
 
 import asyncio
+from datetime import datetime, timezone
 import logging
 import time
 from typing import Any
@@ -16,38 +16,40 @@ from typing import Any
 from fastapi import HTTPException
 import firebase_admin
 from firebase_admin import firestore
-from google.api_core.exceptions import AlreadyExists
 
 from app.models.interview_profile import InterviewProfile
+from app.services.crypto import decrypt_secret, encrypt_secret
 
 logger = logging.getLogger("roundtable.firestore")
 
 _db: Any | None = None
 _session_owner_cache: dict[str, str] = {}
 
-FREE_TIER_DAILY_LIMIT = 2
-_WINDOW_SECONDS = 86_400  # 24 hours
+FREE_TIER_MONTHLY_LIMIT = 2
 ACCOUNT_DELETION_LEASE_SECONDS = 15 * 60
 
+def _get_current_period() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m")
 
-def _recent_session_epochs(session_epochs: Any, cutoff: float) -> list[float]:
-    if not isinstance(session_epochs, list):
-        return []
-    return [
-        timestamp
-        for timestamp in session_epochs
-        if isinstance(timestamp, (int, float)) and timestamp > cutoff
-    ]
+def _get_resets_at() -> str:
+    now = datetime.now(timezone.utc)
+    year = now.year
+    month = now.month + 1
+    if month > 12:
+        month = 1
+        year += 1
+    resets_at = datetime(year, month, 1, 0, 0, 0, tzinfo=timezone.utc)
+    return resets_at.isoformat().replace("+00:00", "Z")
 
-
-def _user_limits(used: int, has_joined_waitlist: bool) -> dict:
-    remaining = max(0, FREE_TIER_DAILY_LIMIT - used)
+def _monthly_quota_response(used: int) -> dict:
+    remaining = max(0, FREE_TIER_MONTHLY_LIMIT - used)
     return {
-        "daily_limit": FREE_TIER_DAILY_LIMIT,
-        "used_today": used,
+        "limit": FREE_TIER_MONTHLY_LIMIT,
+        "used": used,
         "remaining": remaining,
-        "can_start": remaining > 0,
-        "has_joined_waitlist": has_joined_waitlist,
+        "available": remaining > 0,
+        "period": _get_current_period(),
+        "resets_at": _get_resets_at(),
     }
 
 
@@ -67,64 +69,31 @@ def get_db() -> Any | None:
         return None
 
 
-# ---------------------------------------------------------------------------
-# Waitlist Collection ('waitlist')
-# ---------------------------------------------------------------------------
-
-async def save_waitlist_user(uid: str, email: str, name: str, source: str = "android_pro_dialog") -> dict:
-    """Creates a waitlist record in Firestore, idempotently by Firebase UID."""
-    db = get_db()
-    if db is None:
-        raise HTTPException(status_code=503, detail="Waitlist storage is temporarily unavailable.")
-
-    def _sync_save():
-        doc_ref = db.collection("waitlist").document(uid)
-        try:
-            doc_ref.create(
-                {
-                    "uid": uid,
-                    "email": email,
-                    "name": name,
-                    "source": source,
-                    "joined_at": firestore.SERVER_TIMESTAMP,
-                }
-            )
-            logger.info("Saved waitlist candidate to Firestore: uid=%s", uid)
-            return {"status": "ok", "message": "Added to waitlist", "already_joined": False}
-        except AlreadyExists:
-            return {"status": "ok", "message": "Already on waitlist", "already_joined": True}
-
-    try:
-        return await asyncio.to_thread(_sync_save)
-    except Exception as exc:
-        logger.exception("Firestore save_waitlist_user failed for uid=%s", uid)
-        raise HTTPException(status_code=503, detail="Waitlist storage is temporarily unavailable.") from exc
-
 
 # ---------------------------------------------------------------------------
 # Rate Limiting & User Sessions ('users' and 'sessions')
 # ---------------------------------------------------------------------------
 
-async def get_user_rate_limits(uid: str) -> dict:
-    """Reads Firestore session history and calculates the rolling 24-hour quota."""
-    now = time.time()
-    cutoff = now - _WINDOW_SECONDS
+async def get_global_quota_status(uid: str) -> dict:
+    """Reads the user's monthly quota from users/{uid} in Firestore."""
     db = get_db()
     if db is None:
         raise HTTPException(status_code=503, detail="Interview availability is temporarily unavailable.")
+    
+    period = _get_current_period()
 
     def _sync_get():
         try:
-            has_joined_waitlist = db.collection("waitlist").document(uid).get().exists
             doc_ref = db.collection("users").document(uid)
             doc = doc_ref.get()
             if not doc.exists:
-                return _user_limits(0, has_joined_waitlist)
+                return _monthly_quota_response(0)
             data = doc.to_dict() or {}
-            recent = _recent_session_epochs(data.get("recent_sessions", []), cutoff)
-            return _user_limits(len(recent), has_joined_waitlist)
+            saved_period = data.get("quota_period", "")
+            used = data.get("quota_used", 0) if saved_period == period else 0
+            return _monthly_quota_response(used)
         except Exception as exc:
-            logger.exception("Firestore get_user_rate_limits failed for uid=%s", uid)
+            logger.exception("Firestore get_global_quota_status failed for uid=%s", uid)
             raise HTTPException(
                 status_code=503,
                 detail="Interview availability is temporarily unavailable.",
@@ -142,19 +111,19 @@ async def get_user_rate_limits(uid: str) -> dict:
         ) from exc
 
 
-async def check_and_record_session(
+async def reserve_monthly_quota(
     uid: str,
     channel_name: str,
     profile_id: str,
     mode: str = "full",
     target_skill: str | None = None,
 ) -> None:
-    """Atomically enforces the free-session limit and persists the session."""
-    now = time.time()
-    cutoff = now - _WINDOW_SECONDS
+    """Atomically enforces the candidate's 2-session per month quota on users/{uid}."""
     db = get_db()
     if db is None:
         raise HTTPException(status_code=503, detail="Unable to safely start a session. Please try again.")
+
+    period = _get_current_period()
 
     def _sync_record():
         try:
@@ -165,30 +134,31 @@ async def check_and_record_session(
             @firestore.transactional
             def _record(transaction):
                 user_doc = user_ref.get(transaction=transaction)
-                data = user_doc.to_dict() or {} if user_doc.exists else {}
-                recent = _recent_session_epochs(data.get("recent_sessions", []), cutoff)
+                user_data = user_doc.to_dict() or {} if user_doc.exists else {}
+                
+                saved_period = user_data.get("quota_period", "")
+                used = user_data.get("quota_used", 0) if saved_period == period else 0
 
-                # Only refund a prior attempt that failed before the agent started.
-                # Live sessions must not open the grace window to additional starts.
-                is_retryable_failure = False
-                last_channel = data.get("last_channel")
-                if last_channel and recent and now - recent[-1] < 900:
-                    last_sess_ref = db.collection("sessions").document(last_channel)
-                    last_sess_doc = last_sess_ref.get(transaction=transaction)
-                    if last_sess_doc.exists:
-                        sess_data = last_sess_doc.to_dict() or {}
-                        is_retryable_failure = sess_data.get("status") == "failed"
-
-                if len(recent) >= FREE_TIER_DAILY_LIMIT and not is_retryable_failure:
+                if used >= FREE_TIER_MONTHLY_LIMIT:
                     raise HTTPException(
                         status_code=429,
-                        detail=f"You've used your {FREE_TIER_DAILY_LIMIT} free interviews in the last 24 hours. Upgrade to Roundtable Pro for unlimited mock interviews, or try again later.",
+                        detail="Monthly free interview limit reached."
                     )
+                
+                new_used = used + 1
 
-                if is_retryable_failure and recent:
-                    recent[-1] = now
-                else:
-                    recent.append(now)
+                # Update User Quota directly on users/{uid}
+                transaction.set(
+                    user_ref,
+                    {
+                        "uid": uid,
+                        "quota_period": period,
+                        "quota_used": new_used,
+                        "last_session_at": firestore.SERVER_TIMESTAMP,
+                        "last_channel": channel_name,
+                    },
+                    merge=True,
+                )
 
                 session_data = {
                     "channel_name": channel_name,
@@ -199,20 +169,11 @@ async def check_and_record_session(
                     "stage": "TECHNICAL" if mode != "focused" else "FOCUSED",
                     "report_status": "not_started",
                     "created_at": firestore.SERVER_TIMESTAMP,
+                    "quota_type": "MANAGED"
                 }
                 if target_skill:
                     session_data["target_skill"] = target_skill
 
-                transaction.set(
-                    user_ref,
-                    {
-                        "uid": uid,
-                        "last_session_at": firestore.SERVER_TIMESTAMP,
-                        "last_channel": channel_name,
-                        "recent_sessions": recent,
-                    },
-                    merge=True,
-                )
                 transaction.set(session_ref, session_data)
 
             _record(transaction)
@@ -227,6 +188,115 @@ async def check_and_record_session(
 
     await asyncio.to_thread(_sync_record)
     _session_owner_cache[channel_name] = uid
+
+
+async def reserve_byok_session(
+    uid: str,
+    channel_name: str,
+    profile_id: str,
+    mode: str = "full",
+    target_skill: str | None = None,
+) -> None:
+    """Records a session without consuming the global monthly quota."""
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=503, detail="Unable to safely start a session. Please try again.")
+
+    def _sync_record():
+        try:
+            user_ref = db.collection("users").document(uid)
+            session_ref = db.collection("sessions").document(channel_name)
+            transaction = db.transaction()
+
+            @firestore.transactional
+            def _record(transaction):
+                session_data = {
+                    "channel_name": channel_name,
+                    "uid": uid,
+                    "profile_id": profile_id,
+                    "mode": mode,
+                    "status": "active",
+                    "stage": "TECHNICAL" if mode != "focused" else "FOCUSED",
+                    "report_status": "not_started",
+                    "created_at": firestore.SERVER_TIMESTAMP,
+                    "quota_type": "BYOK"
+                }
+                if target_skill:
+                    session_data["target_skill"] = target_skill
+
+                transaction.set(session_ref, session_data)
+                
+                transaction.set(
+                    user_ref,
+                    {
+                        "uid": uid,
+                        "last_session_at": firestore.SERVER_TIMESTAMP,
+                        "last_channel": channel_name,
+                    },
+                    merge=True,
+                )
+
+            _record(transaction)
+        except Exception as exc:
+            logger.exception("Firestore BYOK session creation failed for uid=%s", uid)
+            raise HTTPException(
+                status_code=503,
+                detail="Unable to safely start a session. Please try again.",
+            ) from exc
+
+    await asyncio.to_thread(_sync_record)
+    _session_owner_cache[channel_name] = uid
+
+
+async def release_quota_reservation(channel_name: str) -> None:
+    """Decrements candidate's monthly quota on users/{uid} if the session start failed."""
+    db = get_db()
+    if db is None:
+        return
+
+    period = _get_current_period()
+
+    def _sync_release():
+        try:
+            session_ref = db.collection("sessions").document(channel_name)
+            transaction = db.transaction()
+
+            @firestore.transactional
+            def _release(transaction):
+                sess_doc = session_ref.get(transaction=transaction)
+                if not sess_doc.exists:
+                    return
+                sess_data = sess_doc.to_dict() or {}
+                if sess_data.get("quota_type") != "MANAGED" or sess_data.get("quota_refunded"):
+                    return
+                
+                uid = sess_data.get("uid")
+                if not uid:
+                    return
+
+                user_ref = db.collection("users").document(uid)
+                user_doc = user_ref.get(transaction=transaction)
+                if user_doc.exists:
+                    u_data = user_doc.to_dict() or {}
+                    saved_period = u_data.get("quota_period", "")
+                    used = u_data.get("quota_used", 0) if saved_period == period else 0
+                    if used > 0:
+                        transaction.update(user_ref, {"quota_used": used - 1})
+
+                transaction.update(session_ref, {
+                    "quota_refunded": True,
+                    "status": "cancelled",
+                    "updated_at": firestore.SERVER_TIMESTAMP
+                })
+
+            _release(transaction)
+        except Exception as exc:
+            logger.exception("Failed to release quota reservation for channel=%s", channel_name)
+
+    await asyncio.to_thread(_sync_release)
+
+
+mark_session_start_failed = release_quota_reservation
 
 
 async def get_user_sessions_for_deletion(uid: str) -> list[dict[str, str]]:
@@ -298,7 +368,7 @@ async def delete_user_data(uid: str) -> tuple[list[str], list[str]]:
             doc.reference for doc in profiles_to_delete + sessions_to_delete
         ] + [
             db.collection("users").document(uid),
-            db.collection("waitlist").document(uid),
+            db.collection("agora_credentials").document(uid),
         ]
         if remove_expired_hold:
             references.append(legal_hold_ref)
@@ -516,6 +586,7 @@ async def mark_session_start_failed(channel_name: str) -> None:
 
     try:
         await asyncio.to_thread(_sync_mark)
+        await release_quota_reservation(channel_name)
     except Exception:
         logger.exception("Could not mark session start as failed for channel=%s", channel_name)
 
@@ -545,6 +616,142 @@ async def require_session_owner(channel_name: str, uid: str) -> None:
     if owner != uid:
         raise HTTPException(status_code=404, detail="Session not found.")
 
+
+# ---------------------------------------------------------------------------
+# Bring Your Own Key (BYOK) Credentials ('agora_credentials')
+# ---------------------------------------------------------------------------
+
+async def save_agora_credentials(
+    uid: str,
+    app_id: str,
+    app_certificate: str,
+    customer_id: str,
+    customer_secret: str,
+    groq_api_key: str = "",
+    connection_status: str = "Connected"
+) -> None:
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=503, detail="Storage temporarily unavailable.")
+
+    enc_app_id = encrypt_secret(app_id)
+    enc_cert = encrypt_secret(app_certificate)
+    enc_cust_id = encrypt_secret(customer_id)
+    enc_cust_secret = encrypt_secret(customer_secret)
+    enc_groq_key = encrypt_secret(groq_api_key)
+
+    def _sync_save():
+        try:
+            doc_ref = db.collection("agora_credentials").document(uid)
+            doc_ref.set({
+                "uid": uid,
+                "encrypted_app_id": enc_app_id,
+                "encrypted_app_certificate": enc_cert,
+                "encrypted_customer_id": enc_cust_id,
+                "encrypted_customer_secret": enc_cust_secret,
+                "encrypted_groq_api_key": enc_groq_key,
+                "connection_status": connection_status,
+                "created_at_timestamp": time.time(),
+                "updated_at_timestamp": time.time(),
+            })
+        except Exception as exc:
+            logger.exception("Failed to save credentials")
+            raise HTTPException(status_code=503, detail="Failed to save credentials") from exc
+
+    await asyncio.to_thread(_sync_save)
+
+async def get_agora_credentials(uid: str) -> dict | None:
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=503, detail="Storage temporarily unavailable.")
+
+    def _sync_get():
+        doc_ref = db.collection("agora_credentials").document(uid)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return None
+        data = doc.to_dict() or {}
+        
+        try:
+            return {
+                "app_id": decrypt_secret(data.get("encrypted_app_id", "")),
+                "app_certificate": decrypt_secret(data.get("encrypted_app_certificate", "")),
+                "customer_id": decrypt_secret(data.get("encrypted_customer_id", "")),
+                "customer_secret": decrypt_secret(data.get("encrypted_customer_secret", "")),
+                "groq_api_key": decrypt_secret(data.get("encrypted_groq_api_key", "")),
+                "connection_status": data.get("connection_status", "Connected")
+            }
+        except Exception as exc:
+            logger.exception("Failed to decrypt credentials")
+            return None
+
+    return await asyncio.to_thread(_sync_get)
+
+# Aliases for backward compatibility
+save_byok_credentials = save_agora_credentials
+get_byok_credentials = get_agora_credentials
+
+async def get_agora_connection_status(uid: str) -> dict | None:
+    """Returns safe connection status and masked credentials without exposing plaintext secrets."""
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=503, detail="Storage temporarily unavailable.")
+
+    def _sync_get():
+        doc_ref = db.collection("agora_credentials").document(uid)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return None
+        data = doc.to_dict() or {}
+        
+        app_id = ""
+        app_cert_masked = ""
+        cust_id_masked = ""
+        cust_secret_masked = ""
+        groq_key_masked = ""
+        try:
+            raw_app_id = decrypt_secret(data.get("encrypted_app_id", ""))
+            raw_cert = decrypt_secret(data.get("encrypted_app_certificate", ""))
+            raw_cust_id = decrypt_secret(data.get("encrypted_customer_id", ""))
+            raw_cust_secret = decrypt_secret(data.get("encrypted_customer_secret", ""))
+            raw_groq = decrypt_secret(data.get("encrypted_groq_api_key", ""))
+            
+            app_id = raw_app_id
+            if raw_cert:
+                app_cert_masked = "••••••••••••"
+            if raw_cust_secret:
+                cust_secret_masked = "••••••••••••"
+            if len(raw_cust_id) > 4:
+                cust_id_masked = "••••" + raw_cust_id[-4:]
+            elif raw_cust_id:
+                cust_id_masked = "••••"
+            if len(raw_groq) > 4:
+                groq_key_masked = "••••" + raw_groq[-4:]
+            elif raw_groq:
+                groq_key_masked = "••••••••••••"
+        except Exception:
+            pass
+
+        return {
+            "connection_status": data.get("connection_status", "Not configured"),
+            "app_id": app_id,
+            "app_certificate": app_cert_masked,
+            "customer_id": cust_id_masked,
+            "customer_secret": cust_secret_masked,
+            "groq_api_key": groq_key_masked,
+        }
+
+    return await asyncio.to_thread(_sync_get)
+
+async def delete_agora_credentials(uid: str) -> None:
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=503, detail="Storage temporarily unavailable.")
+
+    def _sync_delete():
+        db.collection("agora_credentials").document(uid).delete()
+
+    await asyncio.to_thread(_sync_delete)
 
 # ---------------------------------------------------------------------------
 # Profiles Collection ('profiles')
