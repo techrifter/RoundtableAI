@@ -57,18 +57,12 @@ def init_firebase() -> None:
 # Token verification dependencies
 # ---------------------------------------------------------------------------
 
-async def verify_token(authorization: str = Header(...)) -> str:
-    """FastAPI dependency. Extracts and verifies the Firebase ID token from the
-    Authorization: Bearer <token> header. Returns the verified Firebase UID.
-
-    Raises 401 if the token is missing, malformed, expired, or revoked.
-    """
+def _decode_and_verify_token(authorization: str) -> dict:
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Authorization header must be 'Bearer <token>'.")
     token = authorization.removeprefix("Bearer ").strip()
     try:
         decoded = firebase_auth.verify_id_token(token, check_revoked=True)
-        return decoded["uid"]
     except firebase_auth.RevokedIdTokenError:
         raise HTTPException(status_code=401, detail="Session has been revoked. Please sign in again.")
     except firebase_auth.ExpiredIdTokenError:
@@ -78,29 +72,33 @@ async def verify_token(authorization: str = Header(...)) -> str:
     except Exception as exc:
         logger.error("Token verification error: %s", exc)
         raise HTTPException(status_code=401, detail="Could not verify credentials.")
+
+    if not decoded.get("email_verified", False):
+        raise HTTPException(
+            status_code=403,
+            detail="Email address is not verified. Please verify your email.",
+        )
+    return decoded
+
+
+async def verify_token(authorization: str = Header(...)) -> str:
+    """FastAPI dependency. Extracts and verifies the Firebase ID token from the
+    Authorization: Bearer <token> header. Returns the verified Firebase UID.
+
+    Raises 401 if the token is missing, malformed, expired, or revoked, and
+    403 if the account's email address is not verified.
+    """
+    return _decode_and_verify_token(authorization)["uid"]
 
 
 async def verify_user_claims(authorization: str = Header(...)) -> dict:
     """Extracts and verifies the Firebase ID token and returns the full claims dict
     including 'uid', 'email', and 'name'.
     """
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Authorization header must be 'Bearer <token>'.")
-    token = authorization.removeprefix("Bearer ").strip()
-    try:
-        decoded = firebase_auth.verify_id_token(token, check_revoked=True)
-        return {
-            "uid": decoded["uid"],
-            "email": decoded.get("email"),
-            "name": decoded.get("name"),
-        }
-    except firebase_auth.RevokedIdTokenError:
-        raise HTTPException(status_code=401, detail="Session has been revoked. Please sign in again.")
-    except firebase_auth.ExpiredIdTokenError:
-        raise HTTPException(status_code=401, detail="Session expired. Please sign in again.")
-    except firebase_auth.InvalidIdTokenError as exc:
-        raise HTTPException(status_code=401, detail=f"Invalid token: {exc}")
-    except Exception as exc:
-        logger.error("Token verification error: %s", exc)
-        raise HTTPException(status_code=401, detail="Could not verify credentials.")
+    decoded = _decode_and_verify_token(authorization)
+    return {
+        "uid": decoded["uid"],
+        "email": decoded.get("email"),
+        "name": decoded.get("name"),
+    }
 

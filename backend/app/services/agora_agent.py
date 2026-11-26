@@ -31,16 +31,16 @@ def forget_agent_id(channel: str) -> None:
     _agent_id_by_channel.pop(channel, None)
 
 
-def _basic_auth_header() -> str:
-    raw = f"{settings.agora_customer_id}:{settings.agora_customer_secret}".encode()
+def _basic_auth_header(customer_id: str, customer_secret: str) -> str:
+    raw = f"{customer_id}:{customer_secret}".encode()
     return f"Basic {base64.b64encode(raw).decode()}"
 
 
-async def start_agent(channel_name: str, agent_token: str, candidate_uid: int, system_prompt: str) -> dict:
+async def start_agent(app_id: str, customer_id: str, customer_secret: str, channel_name: str, agent_token: str, candidate_uid: int, system_prompt: str) -> dict:
     """Starts an Agora Conversational AI agent in the given channel, wired to our
     custom-LLM endpoint (this backend's /chat/completions, reached via PUBLIC_BASE_URL).
     """
-    url = f"https://api.agora.io/api/conversational-ai-agent/v2/projects/{settings.agora_app_id}/join"
+    url = f"https://api.agora.io/api/conversational-ai-agent/v2/projects/{app_id}/join"
 
     payload = {
         "name": f"roundtable-{channel_name}",
@@ -139,14 +139,14 @@ async def start_agent(channel_name: str, agent_token: str, candidate_uid: int, s
     async with httpx.AsyncClient(timeout=15.0) as client:
         response = await client.post(
             url,
-            headers={"Authorization": _basic_auth_header()},
+            headers={"Authorization": _basic_auth_header(customer_id, customer_secret)},
             json=payload,
         )
         response.raise_for_status()
         return response.json()
 
 
-async def fetch_agent_history(agent_id: str) -> list[dict]:
+async def fetch_agent_history(app_id: str, customer_id: str, customer_secret: str, agent_id: str) -> list[dict]:
     """The agent's full conversation, as role/content messages.
 
     Worth a network call only because it is not subject to the `max_history` cap we
@@ -159,10 +159,10 @@ async def fetch_agent_history(agent_id: str) -> list[dict]:
     """
     url = (
         f"https://api.agora.io/api/conversational-ai-agent/v2/projects/"
-        f"{settings.agora_app_id}/agents/{agent_id}/history"
+        f"{app_id}/agents/{agent_id}/history"
     )
     async with httpx.AsyncClient(timeout=15.0) as client:
-        response = await client.get(url, headers={"Authorization": _basic_auth_header()})
+        response = await client.get(url, headers={"Authorization": _basic_auth_header(customer_id, customer_secret)})
         response.raise_for_status()
         contents = response.json().get("contents") or []
 
@@ -173,13 +173,13 @@ async def fetch_agent_history(agent_id: str) -> list[dict]:
     ]
 
 
-async def stop_agent(agent_id: str) -> None:
+async def stop_agent(app_id: str, customer_id: str, customer_secret: str, agent_id: str) -> None:
     url = (
         f"https://api.agora.io/api/conversational-ai-agent/v2/projects/"
-        f"{settings.agora_app_id}/agents/{agent_id}/leave"
+        f"{app_id}/agents/{agent_id}/leave"
     )
     async with httpx.AsyncClient(timeout=15.0) as client:
-        response = await client.post(url, headers={"Authorization": _basic_auth_header()})
+        response = await client.post(url, headers={"Authorization": _basic_auth_header(customer_id, customer_secret)})
         if response.status_code == 404:
             return
         response.raise_for_status()

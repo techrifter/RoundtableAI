@@ -2,15 +2,16 @@
 
 Roundtable AI is an Android application for voice-based interview practice. Candidates can
 provide a job description, a resume, or both; practice with a full interview panel or focus
-on a technical or system-design skill; and review AI-generated feedback from the session.
+on a technical or system-design skill; configure their own Agora & Groq keys (BYOK); and review AI-generated feedback from the session.
 
 ## Product overview
 
 - **Role-aware interviews:** Documents are parsed into a structured profile used to tailor
   interview questions.
 - **Full mock interviews:** Practice technical, system-design, and behavioral topics in a
-  live voice session.
-- **Focused practice:** Rehearse a selected technical or system-design skill.
+  live voice session (30–40 min).
+- **Focused practice:** Rehearse a selected technical or system-design skill (5–15 min).
+- **Bring Your Own Keys (BYOK):** Connect personal Agora and Groq API keys to run custom-credential mock interviews without consuming Roundtable's shared quota.
 - **Live transcript:** Follow the conversation while speaking naturally and interrupting
   the interviewer.
 - **Session feedback:** Review an evaluation informed by the interview conversation.
@@ -44,9 +45,9 @@ flowchart LR
 2. The app uploads a job description and/or resume to `POST /jd/upload`. The backend
    extracts text, creates a structured interview profile, persists it, and returns a
    `profile_id`.
-3. The app requests `POST /session/start`. The backend checks the user's interview
-   allowance, creates a session, generates channel-scoped Agora tokens, and starts the
-   Conversational AI agent.
+3. The app requests `POST /session/start`. The backend checks the user's monthly interview
+   allowance (or resolves their custom BYOK credentials), creates a session, generates
+   channel-scoped Agora tokens, and starts the Conversational AI agent.
 4. During the live interview, Agora sends conversation turns to the backend's
    OpenAI-compatible `POST /chat/completions` endpoint. The orchestrator selects the
    interview stage and persona, then streams the generated response back to Agora.
@@ -71,13 +72,14 @@ app/
     auth/          Firebase authentication and sign-in UI
     interview/     Interview setup, live session, transcript, and report UI
     network/       Backend API client and response models
+    settings/      BYOK key setup UI and ViewModel
 backend/
   app/
     api/           FastAPI route handlers
     agents/        Interview persona prompt builders
     orchestration/ Stage selection and answer/topic analysis
     evaluation/    Report generation and persistence
-    services/      Document parsing, AI clients, Agora agent and token helpers
+    services/      AES-256-GCM crypto, document parsing, AI clients, Agora agent and token helpers
     static/        Privacy and account-deletion pages
     models/        Pydantic data models
   tests/           Backend unit tests
@@ -92,39 +94,35 @@ Agora callback and public routes do not use app-user authentication.
 
 | Method     | Path                               | Purpose                                                                 |
 | :--------- | :--------------------------------- | :---------------------------------------------------------------------- |
-| `GET`    | `/health`                        | Backend health response.                                                |
-| `POST`   | `/jd/upload`                     | Parse a job description and/or resume; returns a profile.               |
-| `GET`    | `/session/limits`                | Return the authenticated user's rolling 24-hour interview allowance.    |
-| `POST`   | `/session/start`                 | Start a full or focused interview; returns Agora connection details.    |
-| `GET`    | `/session/{channel_name}/stage`  | Retrieve the current interview stage.                                   |
-| `GET`    | `/session/{channel_name}/report` | Retrieve report-generation status and report data.                      |
-| `POST`   | `/session/{channel_name}/end`    | End the session and request its evaluation.                             |
-| `POST`   | `/chat/completions`              | Agora custom-LLM callback; streams OpenAI-compatible response chunks.   |
-| `POST`   | `/user/waitlist`                 | Add the authenticated user to the Pro early-access waitlist.            |
-| `DELETE` | `/user/account`                  | Queue deletion of the authenticated user's account and associated data. |
-| `GET`    | `/privacy`                       | Serve the privacy policy.                                               |
-| `GET`    | `/account-deletion`              | Serve account-deletion instructions.                                    |
+| `GET`      | `/health`                          | Backend health response.                                                |
+| `POST`     | `/jd/upload`                       | Parse a job description and/or resume; returns a profile.               |
+| `GET`      | `/session/quota/status`            | Return the authenticated user's monthly interview allowance.            |
+| `POST`     | `/session/start`                   | Start a full or focused interview in MANAGED or BYOK mode.              |
+| `GET`      | `/session/{channel_name}/stage`    | Retrieve the current interview stage.                                   |
+| `GET`      | `/session/{channel_name}/report`   | Retrieve report-generation status and report data.                      |
+| `POST`     | `/session/{channel_name}/end`      | End the session and request its evaluation.                             |
+| `GET`      | `/settings/agora/status`          | Retrieve BYOK connection status and key details.                        |
+| `POST`     | `/settings/agora/credentials`     | Save or update encrypted BYOK credentials (Agora & Groq keys).          |
+| `DELETE`   | `/settings/agora/credentials`     | Remove stored BYOK credentials.                                         |
+| `POST`     | `/chat/completions`                | Agora custom-LLM callback; streams OpenAI-compatible response chunks.   |
+| `DELETE`   | `/user/account`                    | Queue deletion of the authenticated user's account and associated data. |
+| `GET`      | `/privacy`                         | Serve the privacy policy.                                               |
+| `GET`      | `/account-deletion`                | Serve account-deletion instructions.                                    |
 
 Interactive API documentation is available at `/docs` when the backend is running.
 
 ## Data and privacy
 
 Firestore stores user-owned interview profiles and session records, including report
-status and generated feedback. The service also uses Firestore for interview allowance,
-waitlist, and account-deletion processing. Uploaded document files are processed to
-extract an interview profile; the backend stores the extracted profile rather than an
-archive of the original files. See the [Privacy Policy](https://sites.google.com/view/roundtableai-privacy-policy)
-and [Account Deletion information](https://sites.google.com/view/roundtableai-deletion-policy)
-for user-facing details.
+status and generated feedback. The service also uses Firestore for interview allowance, BYOK credentials, and account-deletion processing. Uploaded document files are processed to extract an interview profile; the backend stores the extracted profile rather than an archive of the original files. See the [Privacy Policy](https://sites.google.com/view/roundtableai-privacy-policy) and [Account Deletion information](https://sites.google.com/view/roundtableai-deletion-policy) for user-facing details.
 
-Free accounts can start two interviews in a rolling 24-hour period. Document upload and
-analysis do not count as an interview; starting one does.
+Free accounts can start 2 interviews per user per calendar month. Document upload and analysis do not count as an interview; starting one does. Candidates can also connect their own Agora & Groq keys (BYOK) to run unlimited mock interviews.
 
 ## Technology
 
 - **Android:** Kotlin, Jetpack Compose, AndroidX, Kotlin coroutines
 - **Authentication:** Firebase Authentication
-- **Backend:** Python 3.11+, FastAPI, Pydantic, Uvicorn
+- **Backend:** Python 3.11+, FastAPI, Pydantic, Uvicorn, Cryptography (AES-256-GCM)
 - **Persistence:** Cloud Firestore through Firebase Admin SDK
 - **Voice:** Agora RTC, RTM, and Conversational AI
 - **AI and speech:** Groq, Deepgram, and MiniMax
@@ -158,7 +156,7 @@ pip install -r requirements.txt
 cd backend
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 From the repository root, copy `backend/.env.example` to `backend/.env`:
@@ -184,6 +182,7 @@ Then configure:
 | `AGORA_CUSTOMER_ID`             | Agora Conversational AI REST API credential.                            |
 | `AGORA_CUSTOMER_SECRET`         | Agora Conversational AI REST API credential.                            |
 | `PUBLIC_BASE_URL`               | Public HTTPS URL used by Agora to call the backend custom-LLM endpoint. |
+| `CREDENTIAL_ENCRYPTION_KEY`     | 32-byte hex string (64 hex chars) for AES-256-GCM BYOK encryption.      |
 | `FIREBASE_SERVICE_ACCOUNT_PATH` | Optional path to a local Firebase service-account JSON file.            |
 
 Keep `.env` and service-account credentials out of version control. For Google Cloud
@@ -194,6 +193,7 @@ Run the backend from the `backend/` directory:
 
 ```bash
 python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+ngrok http 8000
 ```
 
 Agora must be able to reach `PUBLIC_BASE_URL` over HTTPS. For local development, expose

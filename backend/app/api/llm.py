@@ -44,6 +44,29 @@ _answer_times_by_channel: dict[str, list[float]] = {}
 # thing again ("I don't know"). Only text for the same question gets merged.
 _last_question_by_channel: dict[str, str] = {}
 
+# Custom Groq API key per channel when user runs in USER_BYOK mode, with TTL expiration
+_groq_key_by_channel: dict[str, tuple[str, float]] = {}
+GROQ_KEY_TTL_SECONDS = 3600.0  # 1 hour maximum lifetime for in-memory session keys
+
+
+def _prune_expired_groq_keys() -> None:
+    now = time.time()
+    expired = [ch for ch, (_, ts) in list(_groq_key_by_channel.items()) if now - ts > GROQ_KEY_TTL_SECONDS]
+    for ch in expired:
+        clear_channel_state(ch)
+
+
+def set_channel_groq_key(channel: str, key: str) -> None:
+    if key and key.strip():
+        _prune_expired_groq_keys()
+        _groq_key_by_channel[channel] = (key.strip(), time.time())
+
+
+def get_channel_groq_key(channel: str) -> str | None:
+    _prune_expired_groq_keys()
+    entry = _groq_key_by_channel.get(channel)
+    return entry[0] if entry else None
+
 
 def clear_channel_state(channel: str) -> None:
     _current_stage_by_channel.pop(channel, None)
@@ -52,6 +75,7 @@ def clear_channel_state(channel: str) -> None:
     _answers_by_channel.pop(channel, None)
     _answer_times_by_channel.pop(channel, None)
     _last_question_by_channel.pop(channel, None)
+    _groq_key_by_channel.pop(channel, None)
 
 
 def record_answer(channel: str, text: str, question: str = "") -> tuple[list[str], list[float]]:
@@ -197,6 +221,19 @@ async def chat_completions(request: Request):
     else:
         messages = [{"role": "system", "content": system_prompt}, *messages]
 
+    # Reinforce active listening, answer evaluation, and spoken constraints at the end of prompt context
+    if not intro_only and stage != InterviewStage.FINAL_EVAL:
+        messages.append({
+            "role": "system",
+            "content": (
+                "[SYSTEM DIRECTIVE FOR LIVE VOICE INTERVIEW:\n"
+                "1. RESUME-GROUNDED: Actively anchor questions in the candidate's real resume experience and project claims.\n"
+                "2. EVALUATE & COACH: Accept valid answers directly without nudging; probe trade-offs or scale. If incomplete, target the gap. If incorrect, ask a subtle Socratic question to guide self-correction. Never say 'You're wrong'.\n"
+                "3. UNCERTAINTY: If candidate says 'I don't know' or 'Pass', acknowledge briefly without lecturing or teaching, and pivot to another question.\n"
+                "4. NATURAL BREVITY: Target 12-25 words, max 30 words. Natural reaction/acknowledgment when appropriate + exactly ONE clear question. No markdown or code.]"
+            )
+        })
+
     turn_id = f"{time.time():.3f}"
     logger.info("[%s] STAGE: %s", turn_id, stage)
     user_text = next(
@@ -231,21 +268,80 @@ async def chat_completions(request: Request):
                     )
                 }
 
+            if stage == InterviewStage.FINAL_EVAL and not intro_only:
+                # Directly streaming the deterministic closing message eliminates LLM generation delay
+                # for this closing turn and prevents off-prompt conversational drift. Standard network,
+                # SSE framing, TTS synthesis, and client audio playback latencies still apply normally.
+                from app.orchestration.orchestrator import CLOSING_MESSAGE
+                closing_text = CLOSING_MESSAGE
+                generated.append(closing_text)
+                completed_normally = True
+                yield {
+                    "data": json.dumps(
+                        {
+                            "id": turn_id,
+                            "object": "chat.completion.chunk",
+                            "choices": [{"index": 0, "delta": {"role": "assistant", "content": closing_text}, "finish_reason": None}],
+                        }
+                    )
+                }
+                yield {
+                    "data": json.dumps(
+                        {
+                            "id": turn_id,
+                            "object": "chat.completion.chunk",
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        }
+                    )
+                }
+                yield {"data": "[DONE]"}
+                if channel:
+                    clear_channel_state(channel)
+                return
+
             client = get_http_client()
+            groq_key = ((get_channel_groq_key(channel) if channel else None) or settings.groq_api_key or "").strip()
+            if not groq_key:
+                logger.error("[%s] GROQ_API_KEY is missing on backend and channel", turn_id)
+                fallback = "Groq API Key is missing."
+                generated.append(fallback)
+                completed_normally = True
+                yield {
+                    "data": json.dumps(
+                        {
+                            "id": turn_id,
+                            "object": "chat.completion.chunk",
+                            "choices": [{"index": 0, "delta": {"role": "assistant", "content": fallback}, "finish_reason": None}],
+                        }
+                    )
+                }
+                yield {
+                    "data": json.dumps(
+                        {
+                            "id": turn_id,
+                            "object": "chat.completion.chunk",
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        }
+                    )
+                }
+                yield {"data": "[DONE]"}
+                return
+
+            req_json = {
+                "model": settings.groq_model,
+                "messages": messages,
+                "stream": True,
+                # Sized for up to ~3 short questions' worth of content.
+                "max_completion_tokens": 200,
+            }
+            if "gpt-oss" in settings.groq_model:
+                req_json["reasoning_effort"] = "low"
+
             async with client.stream(
                 "POST",
                 GROQ_CHAT_URL,
-                headers={"Authorization": f"Bearer {settings.groq_api_key}"},
-                json={
-                    "model": settings.groq_model,
-                    "messages": messages,
-                    "stream": True,
-                    # Persona prompt now hard-caps replies to one sentence, so
-                    # "low" is enough for quality and cuts LLM latency.
-                    "reasoning_effort": "low",
-                    # Sized for up to ~3 short questions' worth of content.
-                    "max_completion_tokens": 200,
-                },
+                headers={"Authorization": f"Bearer {groq_key}"},
+                json=req_json,
             ) as upstream:
                 if upstream.status_code != 200:
                     # httpx doesn't raise on non-2xx by itself, and a Groq error body
@@ -388,6 +484,8 @@ async def chat_completions(request: Request):
     return EventSourceResponse(event_stream())
 
 
+import re
+
 _TTS_UNSAFE_CHARS = {
     "—": ", ",  # em dash
     "–": ", ",  # en dash
@@ -402,9 +500,20 @@ _TTS_UNSAFE_CHARS = {
 
 def _sanitize_for_tts(text: str) -> str:
     """LLM output commonly uses em dashes, curly quotes, and ellipsis characters
-    that some TTS engines mishandle, producing stutters/glitches right at those
-    characters. Replace them with plain ASCII punctuation before it's spoken.
+    that some TTS engines mishandle. Also strip markdown headers, bolding, code
+    blocks, and asterisks so the agent speaks concise plain sentences.
     """
+    # Remove fenced code blocks ```...```
+    text = re.sub(r"```[\s\S]*?```", "", text)
+    # Remove inline code backticks `...`
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    # Remove markdown headers #, ##, ###
+    text = re.sub(r"#{1,6}\s*", "", text)
+    # Remove markdown bold/italic **, *
+    text = re.sub(r"\*{1,2}([^\*]+)\*{1,2}", r"\1", text)
+    # Remove any stray asterisks
+    text = text.replace("*", "")
+
     for unsafe, replacement in _TTS_UNSAFE_CHARS.items():
         text = text.replace(unsafe, replacement)
     return text

@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
@@ -48,6 +49,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Button
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -60,6 +63,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
@@ -100,6 +104,7 @@ private val SignatureB = Color(0xFFFF3DA6) // magenta
 private val Signature = SignatureA // flat accent use (labels, rims) — gradient reserved for the orb/waveform
 private val SignatureDim = Color(0xFF2B2044)
 private val Danger = Color(0xFFFF4D6D)
+private val SuccessColor = Color(0xFF10B981)
 
 @OptIn(ExperimentalTextApi::class)
 internal val Inter = FontFamily(
@@ -349,6 +354,7 @@ private fun lerp(a: Color, b: Color, t: Float): Color {
 @Composable
 fun InterviewScreen(
     authViewModel: com.techrifter.roundtableai.auth.AuthViewModel,
+    onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val application = LocalContext.current.applicationContext as android.app.Application
@@ -369,21 +375,35 @@ fun InterviewScreen(
     val selectedMode by viewModel.selectedMode.collectAsState()
     val selectedSkill by viewModel.selectedSkill.collectAsState()
 
-    var showUpgradeDialog by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        viewModel.refreshUserLimits()
+    }
+
+
     var showAccountDialog by remember { mutableStateOf(false) }
     var showDeleteAccountDialog by remember { mutableStateOf(false) }
+    var showEndInterviewDialog by remember { mutableStateOf(false) }
     var isDeletingAccount by remember { mutableStateOf(false) }
     var deleteAccountError by remember { mutableStateOf<String?>(null) }
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
-    if (showUpgradeDialog) {
-        UpgradeProDialog(
-            hasJoinedWaitlist = userLimits?.hasJoinedWaitlist == true,
-            onDismiss = { showUpgradeDialog = false },
-            onJoinWaitlist = { viewModel.joinWaitlist() },
-        )
+    // Handle system back gesture per screen state
+    BackHandler(enabled = uiState.status == InterviewStatus.LIVE) {
+        showEndInterviewDialog = true
     }
+    BackHandler(enabled = uiState.status == InterviewStatus.REPORT) {
+        viewModel.startNewInterview()
+    }
+    BackHandler(
+        enabled = profileState.status == ProfileStatus.READY &&
+            uiState.status != InterviewStatus.LIVE &&
+            uiState.status != InterviewStatus.REPORT
+    ) {
+        viewModel.resetProfile()
+    }
+
+
     if (showAccountDialog) {
         Dialog(onDismissRequest = { showAccountDialog = false }) {
             Column(
@@ -397,6 +417,18 @@ fun InterviewScreen(
             ) {
                 Text("Account", color = Ink, fontFamily = Inter, fontSize = 22.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(20.dp))
+                Text(
+                    "Configure BYOK",
+                    color = SignatureA,
+                    fontFamily = Inter,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.clickable {
+                        showAccountDialog = false
+                        onOpenSettings()
+                    },
+                )
+                Spacer(Modifier.height(18.dp))
                 Text(
                     "Privacy policy",
                     color = SignatureA,
@@ -529,6 +561,69 @@ fun InterviewScreen(
             }
         }
     }
+    if (showEndInterviewDialog) {
+        Dialog(onDismissRequest = { showEndInterviewDialog = false }) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(24.dp))
+                    .background(Panel)
+                    .border(1.dp, Danger.copy(alpha = 0.4f), RoundedCornerShape(24.dp))
+                    .padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text(
+                    text = "End interview?",
+                    color = Ink,
+                    fontFamily = Inter,
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center,
+                )
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    text = "Are you sure you want to leave the live interview?",
+                    color = InkMuted,
+                    fontFamily = Inter,
+                    fontSize = 13.5.sp,
+                    textAlign = TextAlign.Center,
+                )
+                Spacer(Modifier.height(20.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "Stay",
+                        color = InkMuted,
+                        fontFamily = Inter,
+                        fontSize = 14.sp,
+                        modifier = Modifier
+                            .weight(1f)
+                            .clickable { showEndInterviewDialog = false }
+                            .padding(vertical = 12.dp),
+                        textAlign = TextAlign.Center,
+                    )
+                    Text(
+                        text = "End Session",
+                        color = Danger,
+                        fontFamily = Inter,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier
+                            .weight(1f)
+                            .clickable {
+                                showEndInterviewDialog = false
+                                viewModel.endInterview()
+                            }
+                            .padding(vertical = 12.dp),
+                        textAlign = TextAlign.Center,
+                    )
+                }
+            }
+        }
+    }
 
     Box(
         modifier = modifier
@@ -560,11 +655,15 @@ fun InterviewScreen(
                 userLimits = userLimits,
                 selectedMode = selectedMode,
                 selectedSkill = selectedSkill,
+                accessMode = viewModel.accessMode.collectAsState().value,
+                byokConnected = viewModel.byokConnected.collectAsState().value,
                 onSelectMode = { viewModel.selectMode(it) },
                 onSelectSkill = { viewModel.selectSkill(it) },
-                onRefreshLimits = { viewModel.refreshUserLimits() },
+                onAccessModeSelect = { viewModel.selectAccessMode(it) },
+                onRefreshLimits = { viewModel.refreshUserLimits(clearError = true) },
                 isRefreshingLimits = isRefreshingLimits,
-                onUpgradeClick = { showUpgradeDialog = true },
+                onUpgradeClick = { onOpenSettings() },
+                onOpenSettings = onOpenSettings,
                 onAnalyze = { jd, resume -> viewModel.analyzeProfile(jd, resume) },
                 onChangeDocuments = { viewModel.resetProfile() },
                 onStart = { viewModel.startInterview() },
@@ -598,11 +697,15 @@ private fun PreJoinContent(
     userLimits: UserLimits?,
     selectedMode: InterviewMode,
     selectedSkill: String?,
+    accessMode: String,
+    byokConnected: Boolean,
     onSelectMode: (InterviewMode) -> Unit,
     onSelectSkill: (String) -> Unit,
+    onAccessModeSelect: (String) -> Unit,
     onRefreshLimits: () -> Unit,
     isRefreshingLimits: Boolean,
     onUpgradeClick: () -> Unit,
+    onOpenSettings: () -> Unit,
     onAnalyze: (Uri?, Uri?) -> Unit,
     onChangeDocuments: () -> Unit,
     onStart: () -> Unit,
@@ -643,14 +746,25 @@ private fun PreJoinContent(
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             // Plan / Limit Status Pill
-            val isLimitReached = userLimits?.canStart == false
+            val isManagedQuotaExhausted = userLimits?.available == false
+            val showRedStatus = isManagedQuotaExhausted && !byokConnected
             Row(
                 modifier = Modifier
                     .clip(RoundedCornerShape(20.dp))
-                    .background(if (isLimitReached) Danger.copy(alpha = 0.15f) else SignatureDim)
+                    .background(
+                        when {
+                            showRedStatus -> Danger.copy(alpha = 0.15f)
+                            byokConnected -> SuccessColor.copy(alpha = 0.15f)
+                            else -> SignatureDim
+                        }
+                    )
                     .border(
                         1.dp,
-                        if (isLimitReached) Danger.copy(alpha = 0.45f) else SignatureA.copy(alpha = 0.35f),
+                        when {
+                            showRedStatus -> Danger.copy(alpha = 0.45f)
+                            byokConnected -> SuccessColor.copy(alpha = 0.45f)
+                            else -> SignatureA.copy(alpha = 0.35f)
+                        },
                         RoundedCornerShape(20.dp),
                     )
                     .clickable(enabled = userLimits != null || !isRefreshingLimits) {
@@ -661,17 +775,18 @@ private fun PreJoinContent(
             ) {
                 Text(
                     text = when {
-                        userLimits == null && isRefreshingLimits -> "Checking limit status…"
-                        userLimits == null -> "Limit status unavailable • Tap to retry"
-                        userLimits.hasJoinedWaitlist && isLimitReached ->
-                            "Daily limit reached (0/${userLimits.dailyLimit}) • Priority Waitlist"
-                        userLimits.hasJoinedWaitlist ->
-                            "Daily limit: ${userLimits.remaining}/${userLimits.dailyLimit} • Priority Waitlist"
-                        isLimitReached -> "Daily limit reached (0/${userLimits.dailyLimit}) • Upgrade"
+                        userLimits == null && isRefreshingLimits -> "Checking status…"
+                        userLimits == null -> "Status unavailable • Tap to retry"
+                        byokConnected -> "Your Agora account: Connected"
+                        isManagedQuotaExhausted -> "Monthly Free Limit (0/${userLimits?.limit ?: 2}) · Switch to BYOK →"
                         else ->
-                            "Daily limit: ${userLimits.remaining}/${userLimits.dailyLimit} • Upgrade"
+                            "Roundtable Free: ${userLimits?.remaining}/${userLimits?.limit} remaining"
                     },
-                    color = if (isLimitReached) Danger else Ink,
+                    color = when {
+                        showRedStatus -> Danger
+                        byokConnected -> SuccessColor
+                        else -> Ink
+                    },
                     fontFamily = Inter,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.SemiBold,
@@ -707,15 +822,20 @@ private fun PreJoinContent(
                     profile = profileState.profile,
                     selectedMode = selectedMode,
                     selectedSkill = selectedSkill,
+                    accessMode = accessMode,
+                    byokConnected = byokConnected,
                     onSelectMode = onSelectMode,
                     onSelectSkill = onSelectSkill,
+                    onAccessModeSelect = onAccessModeSelect,
                     isBusy = isBusy,
                     errorMessage = uiState.errorMessage,
                     userLimits = userLimits,
+                    onRefreshLimits = onRefreshLimits,
                     onUpgradeClick = onUpgradeClick,
+                    onOpenSettings = onOpenSettings,
                     onChangeDocuments = onChangeDocuments,
                     onStart = {
-                        if (userLimits?.canStart == false) {
+                        if (userLimits?.available == false && accessMode == "ROUND_TABLE_MANAGED") {
                             onUpgradeClick()
                         } else if (hasMicPermission) {
                             onStart()
@@ -758,7 +878,6 @@ private fun DocumentSetupSection(
     onAnalyze: () -> Unit,
 ) {
     val isUploading = profileState.status == ProfileStatus.UPLOADING
-    val isLimitReached = userLimits?.canStart == false
     val canAnalyze = (jdName != null || resumeName != null) && !isUploading
 
     Text(
@@ -775,17 +894,7 @@ private fun DocumentSetupSection(
     Spacer(Modifier.height(12.dp))
     DocumentPickerRow(label = "Your resume", fileName = resumeName, enabled = !isUploading, onPick = onPickResume)
 
-    if (isLimitReached) {
-        Spacer(Modifier.height(16.dp))
-        Text(
-            text = "Upgrade to Pro for unlimited practice →",
-            color = SignatureA,
-            fontFamily = Inter,
-            fontSize = 13.sp,
-            fontWeight = FontWeight.Bold,
-            modifier = Modifier.clickable { onUpgradeClick() }
-        )
-    } else if (profileState.status == ProfileStatus.FAILED) {
+    if (profileState.status == ProfileStatus.FAILED) {
         Spacer(Modifier.height(16.dp))
         Text(
             text = profileState.errorMessage ?: "Couldn't read that JD/resume.",
@@ -798,9 +907,9 @@ private fun DocumentSetupSection(
 
     Spacer(Modifier.height(28.dp))
     PrimaryButton(
-        label = if (isLimitReached) "Upgrade to Pro" else if (isUploading) "Reading documents…" else "Analyze documents",
-        enabled = if (isLimitReached) true else canAnalyze,
-        onClick = if (isLimitReached) onUpgradeClick else onAnalyze,
+        label = if (isUploading) "Reading documents…" else "Analyze documents",
+        enabled = canAnalyze,
+        onClick = onAnalyze,
     )
 }
 
@@ -841,16 +950,21 @@ private fun ProfileReadySection(
     profile: InterviewProfilePreview,
     selectedMode: InterviewMode,
     selectedSkill: String?,
+    accessMode: String,
+    byokConnected: Boolean,
     onSelectMode: (InterviewMode) -> Unit,
     onSelectSkill: (String) -> Unit,
+    onAccessModeSelect: (String) -> Unit,
     isBusy: Boolean,
     errorMessage: String?,
     userLimits: UserLimits?,
+    onRefreshLimits: () -> Unit,
     onUpgradeClick: () -> Unit,
+    onOpenSettings: () -> Unit,
     onChangeDocuments: () -> Unit,
     onStart: () -> Unit,
 ) {
-    val isLimitReached = userLimits?.canStart == false && !isBusy
+    val isLimitReached = userLimits?.available == false && !byokConnected && !isBusy && accessMode == "ROUND_TABLE_MANAGED"
 
     Text(
         text = "READY TO INTERVIEW FOR",
@@ -925,11 +1039,42 @@ private fun ProfileReadySection(
         ) {
             if (profile.skills.isNotEmpty()) {
                 Box(modifier = Modifier.padding(start = 28.dp)) {
-                    SkillChipsRow(skills = profile.skills.take(5))
+                    SkillChipsRow(skills = profile.skills.take(8))
                 }
             }
         }
     }
+
+    Spacer(Modifier.height(32.dp))
+    Text(
+        text = "Access Option",
+        color = Ink,
+        fontFamily = Inter,
+        fontWeight = FontWeight.SemiBold,
+        fontSize = 16.sp
+    )
+    Spacer(Modifier.height(16.dp))
+
+    val isManagedAvailable = userLimits?.available != false
+    ModeOptionCard(
+        title = "Roundtable Free",
+        description = if (isManagedAvailable) "Shared platform capacity: ${userLimits?.remaining ?: 0} of ${userLimits?.limit ?: 2} remaining this month" else "Shared platform capacity: 0 of ${userLimits?.limit ?: 2} remaining this month",
+        duration = if (isManagedAvailable) "${userLimits?.remaining ?: 0}/${userLimits?.limit ?: 2}" else "Limit reached",
+        badgeText = if (isManagedAvailable) "FREE" else "EXHAUSTED",
+        badgeColor = if (isManagedAvailable) Signature else Danger,
+        isSelected = accessMode == "ROUND_TABLE_MANAGED",
+        enabled = isManagedAvailable,
+        onClick = { onAccessModeSelect("ROUND_TABLE_MANAGED") },
+    )
+    Spacer(Modifier.height(12.dp))
+    ModeOptionCard(
+        title = "Bring Your Own Agora",
+        description = "Uses your own Agora account, subject to its quotas and billing.",
+        duration = if (byokConnected) "Unlimited" else "Configure",
+        isSelected = accessMode == "USER_BYOK",
+        onClick = { onAccessModeSelect("USER_BYOK") },
+        onDurationClick = { onOpenSettings() },
+    )
 
     if (errorMessage != null && !isBusy) {
         Spacer(Modifier.height(16.dp))
@@ -937,27 +1082,37 @@ private fun ProfileReadySection(
     } else if (isLimitReached) {
         Spacer(Modifier.height(16.dp))
         Text(
-            text = "Upgrade to Pro for unlimited practice →",
-            color = SignatureA,
+            text = "Roundtable's monthly free interview limit has been reached.",
+            color = Danger,
             fontFamily = Inter,
-            fontSize = 13.sp,
+            fontSize = 14.sp,
             fontWeight = FontWeight.Bold,
-            modifier = Modifier.clickable { onUpgradeClick() }
+            textAlign = TextAlign.Center
         )
+        Spacer(Modifier.height(12.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+            Button(onClick = onOpenSettings) {
+                Text("Connect Agora Account")
+            }
+            OutlinedButton(onClick = onRefreshLimits) {
+                Text("Retry")
+            }
+        }
     }
 
-    Spacer(Modifier.height(26.dp))
-    val buttonLabel = when {
-        isBusy -> "Connecting…"
-        isLimitReached -> "Upgrade to Pro"
-        selectedMode == InterviewMode.FOCUSED -> "Begin Focused Practice"
-        else -> "Begin Full Interview"
+    if (!isLimitReached) {
+        Spacer(Modifier.height(26.dp))
+        val buttonLabel = when {
+            isBusy -> "Connecting…"
+            selectedMode == InterviewMode.FOCUSED -> "Begin Focused Practice"
+            else -> "Begin Full Interview"
+        }
+        PrimaryButton(
+            label = buttonLabel,
+            enabled = !isBusy,
+            onClick = onStart,
+        )
     }
-    PrimaryButton(
-        label = buttonLabel,
-        enabled = !isBusy,
-        onClick = if (isLimitReached) onUpgradeClick else onStart,
-    )
     Spacer(Modifier.height(14.dp))
     Text(
         text = "Change documents",
@@ -978,32 +1133,35 @@ private fun ProfileReadySection(
 private fun ModeOptionCard(
     title: String,
     duration: String,
-    badgeText: String,
-    badgeColor: Color,
+    badgeText: String? = null,
+    badgeColor: Color = Signature,
     description: String,
     isSelected: Boolean,
+    enabled: Boolean = true,
     onClick: () -> Unit,
+    onDurationClick: (() -> Unit)? = null,
     content: @Composable (() -> Unit)? = null,
 ) {
     Box(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(18.dp))
-            .background(if (isSelected) Panel else Panel.copy(alpha = 0.5f))
+            .background(if (isSelected && enabled) Panel else Panel.copy(alpha = 0.35f))
             .border(
-                width = if (isSelected) 1.5.dp else 1.dp,
-                brush = if (isSelected) Brush.horizontalGradient(listOf(SignatureA, SignatureB))
-                else Brush.linearGradient(listOf(SignatureDim, SignatureDim)),
+                width = if (isSelected && enabled) 1.5.dp else 1.dp,
+                brush = if (isSelected && enabled) Brush.horizontalGradient(listOf(SignatureA, SignatureB))
+                else Brush.linearGradient(listOf(SignatureDim.copy(alpha = 0.3f), SignatureDim.copy(alpha = 0.3f))),
                 shape = RoundedCornerShape(18.dp),
             )
             .clickable(
+                enabled = enabled,
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() },
                 onClick = onClick,
             )
             .padding(14.dp),
     ) {
-        Column {
+        Column(modifier = Modifier.alpha(if (enabled) 1f else 0.45f)) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -1037,29 +1195,50 @@ private fun ModeOptionCard(
                 }
 
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text = duration,
-                        color = InkFaint,
-                        fontFamily = Inter,
-                        fontSize = 11.5.sp,
-                        fontWeight = FontWeight.Medium,
-                    )
-                    Spacer(Modifier.width(8.dp))
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(badgeColor.copy(alpha = 0.15f))
-                            .border(1.dp, badgeColor.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
-                            .padding(horizontal = 7.dp, vertical = 2.dp),
-                    ) {
+                    if (onDurationClick != null) {
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(SignatureDim)
+                                .border(1.dp, SignatureA.copy(alpha = 0.5f), RoundedCornerShape(8.dp))
+                                .clickable { onDurationClick() }
+                                .padding(horizontal = 8.dp, vertical = 3.dp)
+                        ) {
+                            Text(
+                                text = duration,
+                                color = SignatureA,
+                                fontFamily = Inter,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                            )
+                        }
+                    } else {
                         Text(
-                            text = badgeText,
-                            color = badgeColor,
+                            text = duration,
+                            color = InkFaint,
                             fontFamily = Inter,
-                            fontSize = 9.5.sp,
-                            fontWeight = FontWeight.Bold,
-                            letterSpacing = 0.6.sp,
+                            fontSize = 11.5.sp,
+                            fontWeight = FontWeight.Medium,
                         )
+                    }
+                    if (!badgeText.isNullOrEmpty()) {
+                        Spacer(Modifier.width(8.dp))
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(badgeColor.copy(alpha = 0.15f))
+                                .border(1.dp, badgeColor.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
+                                .padding(horizontal = 7.dp, vertical = 2.dp),
+                        ) {
+                            Text(
+                                text = badgeText,
+                                color = badgeColor,
+                                fontFamily = Inter,
+                                fontSize = 9.5.sp,
+                                fontWeight = FontWeight.Bold,
+                                letterSpacing = 0.6.sp,
+                            )
+                        }
                     }
                 }
             }
@@ -1669,155 +1848,4 @@ private fun formatElapsed(totalSeconds: Int): String {
     return "%02d:%02d".format(minutes, seconds)
 }
 
-@Composable
-private fun UpgradeProDialog(
-    hasJoinedWaitlist: Boolean = false,
-    onDismiss: () -> Unit,
-    onJoinWaitlist: suspend () -> Boolean,
-) {
-    var joinedWaitlist by remember(hasJoinedWaitlist) { mutableStateOf(hasJoinedWaitlist) }
-    var isSubmitting by remember { mutableStateOf(false) }
-    var errorMessage by remember { mutableStateOf<String?>(null) }
-    val scope = rememberCoroutineScope()
 
-    Dialog(onDismissRequest = onDismiss) {
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(24.dp))
-                .background(Panel)
-                .border(1.dp, SignatureA.copy(alpha = 0.4f), RoundedCornerShape(24.dp))
-                .padding(24.dp)
-        ) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(Brush.horizontalGradient(listOf(SignatureA, SignatureB)))
-                        .padding(horizontal = 14.dp, vertical = 6.dp)
-                ) {
-                    Text(
-                        text = "ROUNDTABLE PRO",
-                        color = Ink,
-                        fontFamily = Inter,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        letterSpacing = 1.6.sp
-                    )
-                }
-                Spacer(Modifier.height(16.dp))
-                Text(
-                    text = "Daily Practice Limit",
-                    color = Ink,
-                    fontFamily = Inter,
-                    fontSize = 22.sp,
-                    fontWeight = FontWeight.Bold,
-                    textAlign = TextAlign.Center
-                )
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    text = "Free accounts get 2 interviews in a rolling 24-hour window. Upgrade to Pro for unlimited simulations, targeted skill drills, and advanced panel customization.",
-                    color = InkMuted,
-                    fontFamily = Inter,
-                    fontSize = 13.5.sp,
-                    lineHeight = 19.sp,
-                    textAlign = TextAlign.Center
-                )
-                Spacer(Modifier.height(20.dp))
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(16.dp))
-                        .background(Backdrop)
-                        .padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    ProFeatureRow("⚡", "Unlimited AI voice interviews daily")
-                    ProFeatureRow("🎯", "In-depth turn analysis & rubric feedback")
-                    ProFeatureRow("🏢", "Custom FAANG & startup panel difficulty")
-                    ProFeatureRow("🔄", "Targeted technical & system design practice")
-                }
-                Spacer(Modifier.height(24.dp))
-                if (joinedWaitlist) {
-                    Text(
-                        text = "🎉 You're on the priority waitlist! We'll notify you as soon as Pro billing is available.",
-                        color = SignatureB,
-                        fontFamily = Inter,
-                        fontSize = 13.sp,
-                        textAlign = TextAlign.Center,
-                        fontWeight = FontWeight.Medium,
-                    )
-                } else {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(48.dp)
-                            .clip(RoundedCornerShape(24.dp))
-                            .background(
-                                if (isSubmitting) Brush.horizontalGradient(listOf(SignatureA.copy(alpha = 0.5f), SignatureB.copy(alpha = 0.5f)))
-                                else Brush.horizontalGradient(listOf(SignatureA, SignatureB))
-                            )
-                            .clickable(enabled = !isSubmitting) {
-                                scope.launch {
-                                    isSubmitting = true
-                                    errorMessage = null
-                                    val success = onJoinWaitlist()
-                                    isSubmitting = false
-                                    if (success) {
-                                        joinedWaitlist = true
-                                    } else {
-                                        errorMessage = "Couldn't reach server. Please check your connection."
-                                    }
-                                }
-                            },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        if (isSubmitting) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(22.dp),
-                                color = Ink,
-                                strokeWidth = 2.dp,
-                            )
-                        } else {
-                            Text(
-                                text = "Join Pro Waitlist (50% Off)",
-                                color = Ink,
-                                fontFamily = Inter,
-                                fontSize = 15.sp,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                        }
-                    }
-                }
-                if (errorMessage != null) {
-                    Spacer(Modifier.height(10.dp))
-                    Text(
-                        text = errorMessage!!,
-                        color = Danger,
-                        fontFamily = Inter,
-                        fontSize = 12.5.sp,
-                        textAlign = TextAlign.Center,
-                    )
-                }
-                Spacer(Modifier.height(14.dp))
-                Text(
-                    text = if (joinedWaitlist) "Close" else "Maybe later",
-                    color = InkFaint,
-                    fontFamily = Inter,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Medium,
-                    modifier = Modifier.clickable { onDismiss() }
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun ProFeatureRow(icon: String, text: String) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text(text = icon, fontSize = 15.sp)
-        Spacer(Modifier.width(10.dp))
-        Text(text = text, color = Ink, fontFamily = Inter, fontSize = 13.sp, fontWeight = FontWeight.Normal)
-    }
-}

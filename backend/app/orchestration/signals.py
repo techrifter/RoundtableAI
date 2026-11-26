@@ -9,10 +9,10 @@ UNCERTAIN_PHRASES = [
     "can't recall", "cant recall", "don't remember", "dont remember",
 ]
 
-# Below this word count, treat an answer as too thin to signal real engagement,
-# even without an explicit "I don't know" — regardless, this alone isn't enough
-# to fast-exit a topic (see is_low_engagement), only paired with an uncertain phrase.
-THIN_ANSWER_WORD_COUNT = 4
+# Below this word count, treat an answer as too thin to signal real engagement.
+# Sized small so valid short technical answers ("Using Redis", "With coroutines")
+# are never misflagged as low-engagement.
+THIN_ANSWER_WORD_COUNT = 2
 
 
 @dataclass
@@ -33,8 +33,6 @@ def analyze_answer(text: str, topic_pool: list[str]) -> AnswerSignal:
 
     has_uncertain_phrase = any(phrase in lowered for phrase in UNCERTAIN_PHRASES)
     is_thin = word_count <= THIN_ANSWER_WORD_COUNT
-    # Either alone is enough: "I don't know" is explicit, and a genuine "no
-    # experience with X" is usually short anyway.
     is_low_engagement = has_uncertain_phrase or is_thin
 
     return AnswerSignal(matched_topics=matched, is_low_engagement=is_low_engagement)

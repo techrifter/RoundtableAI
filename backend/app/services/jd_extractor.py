@@ -1,4 +1,5 @@
 import json
+from fastapi import HTTPException
 
 from app.config import settings
 from app.models.interview_profile import InterviewProfile
@@ -25,9 +26,20 @@ missing, leave candidate_highlights as an empty list rather than inventing claim
 information on."""
 
 
-async def extract_interview_profile(jd_text: str | None, resume_text: str | None) -> InterviewProfile:
+async def extract_interview_profile(
+    jd_text: str | None,
+    resume_text: str | None,
+    groq_api_key: str | None = None
+) -> InterviewProfile:
     if not (jd_text or "").strip() and not (resume_text or "").strip():
         raise ValueError("Need at least a job description or a resume to build an interview profile.")
+
+    api_key = (groq_api_key or settings.groq_api_key or "").strip()
+    if not api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="Groq API Key is missing."
+        )
 
     jd_section = f"JOB DESCRIPTION:\n{jd_text}" if jd_text and jd_text.strip() else "JOB DESCRIPTION: (not provided)"
     resume_section = (
@@ -35,19 +47,27 @@ async def extract_interview_profile(jd_text: str | None, resume_text: str | None
     )
 
     client = get_http_client()
+    req_json = {
+        "model": settings.groq_model,
+        "messages": [
+            {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+            {"role": "user", "content": f"{jd_section}\n\n{resume_section}"},
+        ],
+        "response_format": {"type": "json_object"},
+    }
+    if "gpt-oss" in settings.groq_model:
+        req_json["reasoning_effort"] = "low"
+
     response = await client.post(
         GROQ_CHAT_URL,
-        headers={"Authorization": f"Bearer {settings.groq_api_key}"},
-        json={
-            "model": settings.groq_model,
-            "messages": [
-                {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-                {"role": "user", "content": f"{jd_section}\n\n{resume_section}"},
-            ],
-            "response_format": {"type": "json_object"},
-            "reasoning_effort": "low",
-        },
+        headers={"Authorization": f"Bearer {api_key}"},
+        json=req_json,
     )
+    if response.status_code in (401, 403):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid Groq API Key."
+        )
     response.raise_for_status()
     content = response.json()["choices"][0]["message"]["content"]
     return InterviewProfile.model_validate(json.loads(content))

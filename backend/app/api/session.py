@@ -12,7 +12,7 @@ from app.api.jd import (
     get_profile_for_channel,
     get_stored_profile_async,
 )
-from app.api.llm import get_current_stage, get_last_messages
+from app.api.llm import clear_channel_state, get_current_stage, get_last_messages, set_channel_groq_key
 from app.auth import verify_token
 from app.config import settings
 from app.evaluation.report import (
@@ -23,15 +23,17 @@ from app.evaluation.report import (
     start_report_generation,
 )
 from app.firestore_db import (
-    check_and_record_session,
-    get_user_rate_limits,
+    reserve_monthly_quota,
+    reserve_byok_session,
+    get_global_quota_status,
+    get_agora_credentials,
     mark_session_start_failed,
     require_session_owner,
     update_session_agent_id,
     update_session_stage_in_firestore,
 )
 from app.orchestration.orchestrator import InterviewStage, resolve_focused_stage
-from app.services.agora_agent import AGENT_UID, remember_agent_id, start_agent
+from app.services.agora_agent import AGENT_UID, forget_agent_id, get_agent_id, remember_agent_id, start_agent, stop_agent
 from app.services.agora_token import build_agent_rtc_rtm_token, build_rtc_token, build_rtm_token
 
 router = APIRouter(prefix="/session")
@@ -43,7 +45,7 @@ class StartSessionRequest(BaseModel):
     profile_id: str
     mode: str = "full"  # "full" | "focused"
     target_skill: str | None = None
-
+    access_mode: str = "ROUND_TABLE_MANAGED"
 
 class StartSessionResponse(BaseModel):
     app_id: str
@@ -54,10 +56,10 @@ class StartSessionResponse(BaseModel):
     agent_id: str
 
 
-@router.get("/limits")
-async def get_session_limits(uid: str = Depends(verify_token)):
-    """Returns the user's free tier limits and remaining interviews in the rolling 24-hour window."""
-    return await get_user_rate_limits(uid)
+@router.get("/quota/status")
+async def get_quota_status(uid: str = Depends(verify_token)):
+    """Returns the global monthly quota and limits."""
+    return await get_global_quota_status(uid)
 
 
 @router.post("/start", response_model=StartSessionResponse)
@@ -73,17 +75,45 @@ async def start_session(request: StartSessionRequest, uid: str = Depends(verify_
         raise HTTPException(status_code=404, detail="Unknown profile_id — call POST /jd/upload first.")
 
     channel_name = f"roundtable-{secrets.token_hex(16)}"
-    await check_and_record_session(
-        uid,
-        channel_name,
-        request.profile_id,
-        mode=request.mode,
-        target_skill=request.target_skill,
-    )
+    
+    app_id = settings.agora_app_id
+    app_certificate = settings.agora_app_certificate
+    customer_id = settings.agora_customer_id
+    customer_secret = settings.agora_customer_secret
 
-    candidate_token = build_rtc_token(channel_name, CANDIDATE_UID)
-    agent_token = build_agent_rtc_rtm_token(channel_name, AGENT_UID, str(AGENT_UID))
-    rtm_token = build_rtm_token(str(CANDIDATE_UID))
+    if request.access_mode == "USER_BYOK":
+        creds = await get_agora_credentials(uid)
+        if not creds:
+            raise HTTPException(status_code=400, detail="BYOK credentials not configured.")
+        app_id = creds.get("app_id", "").strip()
+        app_certificate = creds.get("app_certificate", "").strip()
+        customer_id = creds.get("customer_id", "").strip()
+        customer_secret = creds.get("customer_secret", "").strip()
+        
+        if not (app_id and app_certificate and customer_id and customer_secret):
+            raise HTTPException(status_code=400, detail="Agora keys missing in BYOK Settings.")
+
+        if creds.get("groq_api_key"):
+            set_channel_groq_key(channel_name, creds["groq_api_key"])
+        await reserve_byok_session(
+            uid,
+            channel_name,
+            request.profile_id,
+            mode=request.mode,
+            target_skill=request.target_skill,
+        )
+    else:
+        await reserve_monthly_quota(
+            uid,
+            channel_name,
+            request.profile_id,
+            mode=request.mode,
+            target_skill=request.target_skill,
+        )
+
+    candidate_token = build_rtc_token(app_id, app_certificate, channel_name, CANDIDATE_UID)
+    agent_token = build_agent_rtc_rtm_token(app_id, app_certificate, channel_name, AGENT_UID, str(AGENT_UID))
+    rtm_token = build_rtm_token(app_id, app_certificate, str(CANDIDATE_UID))
 
     bind_profile_to_channel(
         channel_name,
@@ -103,6 +133,9 @@ async def start_session(request: StartSessionRequest, uid: str = Depends(verify_
 
     try:
         agent_response = await start_agent(
+            app_id=app_id,
+            customer_id=customer_id,
+            customer_secret=customer_secret,
             channel_name=channel_name,
             agent_token=agent_token,
             candidate_uid=CANDIDATE_UID,
@@ -110,14 +143,14 @@ async def start_session(request: StartSessionRequest, uid: str = Depends(verify_
         )
     except Exception as exc:
         await mark_session_start_failed(channel_name)
-        raise HTTPException(status_code=502, detail=f"Failed to start Agora agent: {exc}") from exc
+        raise HTTPException(status_code=502, detail="Failed to start session. Please try again.") from exc
 
     agent_id = agent_response.get("agent_id", "")
     remember_agent_id(channel_name, agent_id)
     await update_session_agent_id(channel_name, agent_id)
 
     return StartSessionResponse(
-        app_id=settings.agora_app_id,
+        app_id=app_id,
         channel_name=channel_name,
         candidate_uid=CANDIDATE_UID,
         candidate_token=candidate_token,
@@ -176,4 +209,28 @@ async def end_session(channel_name: str, uid: str = Depends(verify_token)):
         mode=mode,
         target_skill=target_skill,
     )
+    clear_channel_state(channel_name)
     return get_report_status(channel_name)
+
+
+@router.post("/{channel_name}/cancel")
+async def cancel_session(channel_name: str, uid: str = Depends(verify_token)):
+    """Called when client initialization or channel joining fails before an interview occurs.
+    Refunds the reserved quota, stops the started Agora agent if running, and cleans up all state.
+    """
+    await require_session_owner(channel_name, uid)
+    agent_id = get_agent_id(channel_name)
+    if agent_id:
+        creds = await get_agora_credentials(uid)
+        app_id = (creds.get("app_id") if creds else None) or settings.agora_app_id
+        customer_id = (creds.get("customer_id") if creds else None) or settings.agora_customer_id
+        customer_secret = (creds.get("customer_secret") if creds else None) or settings.agora_customer_secret
+        try:
+            await stop_agent(app_id, customer_id, customer_secret, agent_id)
+        except Exception:
+            pass
+        forget_agent_id(channel_name)
+
+    await mark_session_start_failed(channel_name)
+    clear_channel_state(channel_name)
+    return {"status": "cancelled"}

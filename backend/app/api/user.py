@@ -3,20 +3,10 @@ import logging
 from fastapi import APIRouter, Depends, status
 
 from app.auth import verify_user_claims
-from app.firestore_db import enqueue_account_deletion, save_waitlist_user
+from app.firestore_db import enqueue_account_deletion
 
 router = APIRouter(prefix="/user")
 logger = logging.getLogger("roundtable.account")
-
-
-@router.post("/waitlist")
-async def join_waitlist(user: dict = Depends(verify_user_claims)):
-    """Saves the candidate's UID and email to the Pro early-access waitlist in Firestore."""
-    uid = user["uid"]
-    email = user.get("email") or "no-email-provided"
-    name = user.get("name") or ""
-
-    return await save_waitlist_user(uid=uid, email=email, name=name, source="android_pro_dialog")
 
 
 @router.delete("/account", status_code=status.HTTP_202_ACCEPTED)

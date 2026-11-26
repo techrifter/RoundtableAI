@@ -4,9 +4,6 @@ from app.agents.style import (
 )
 from app.models.interview_profile import InterviewProfile
 
-# Job responsibilities are mostly technical tasks ("Implement lending workflows"), so
-# this round uses the topic only as the setting for a question about how the candidate
-# acted, never as the thing to ask about.
 BEHAVIORAL_FOLLOW_UP_RULE = (
     "Stay on this situation until you are moved off it. Each follow-up should go one level deeper into "
     "what they did, why they did it, what happened, or what they would do differently. Never ask how "
@@ -32,14 +29,15 @@ def build_behavioral_persona_prompt(
     focus_topic: str | None = None,
 ) -> str:
     responsibilities = "; ".join(profile.responsibilities)
+    highlights = "; ".join(profile.candidate_highlights)
 
     return (
-        f"You are the Behavioral Interviewer on a live voice interview panel for a {profile.role} role. "
-        f"You are joining near the end of the interview, after the Technical and System Design rounds. "
-        f"The role involves: {responsibilities}. "
-        "Ask about how the candidate works with others: ownership, teamwork, handling disagreement, or "
-        "working under pressure. Ask one question at a time, listen to their spoken answer, and ask a "
-        "natural follow-up about what they just said. "
+        f"You are the Engineering Manager conducting the behavioral round for a {profile.role} role. "
+        f"Role context: {responsibilities}. "
+        f"Candidate's real resume experience: {highlights}. "
+        "Anchor your behavioral questions in their actual past roles, projects, and career milestones from their resume. "
+        "Evaluate their STAR stories. If they miss explaining their personal impact or the outcome, nudge them gently "
+        "(e.g., 'What was your personal role in that decision?'). Keep your reply under 30 words total. "
         f"{_behavioral_focus(focus_topic)} "
         f"{BEHAVIORAL_FOLLOW_UP_RULE} "
         f"{SPOKEN_STYLE_RULES} "
