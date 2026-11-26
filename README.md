@@ -236,3 +236,9 @@ This project is released under the [MIT License](LICENSE). Agora access-token co
 `backend/app/services/agora_access_token/` is derived from
 [AgoraIO/Tools](https://github.com/AgoraIO/Tools) and includes attribution in its source
 files.
+
+## Google Play Store
+
+Experience smarter interview preparation with Roundtable AI:
+
+[![Get it on Google Play](https://upload.wikimedia.org/wikipedia/commons/7/78/Google_Play_Store_badge_EN.svg)](https://play.google.com/store/apps/details?id=com.techrifter.roundtableai)
